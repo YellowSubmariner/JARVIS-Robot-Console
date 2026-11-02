@@ -1,0 +1,33 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output; JARVIS.spec is intentionally tracked
+/build/
+/dist/
+/Windows/
+*.exe
+*.dll
+*.pyd
+*.whl
+
+# User settings, logs, and captured images
+data/
+screenshots/
+*.log
+
+# Local secrets and editor/OS state
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
