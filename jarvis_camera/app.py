@@ -14,6 +14,7 @@ import cv2
 from PIL import Image, ImageEnhance, ImageTk
 
 from .capture import CameraStream, enumerate_usb_cameras
+from .recording_page import RecordingPage
 from .settings import Settings, app_directory, validate_rtsp_url
 
 BG = '#0a101b'
@@ -219,6 +220,7 @@ class CameraConsole(tk.Tk):
         logging.basicConfig(filename=str(self.settings.directory / 'app.log'), level=logging.INFO,
                             format='%(asctime)s %(levelname)s %(message)s', encoding='utf-8')
         self._closing = False
+        self._close_pending = False
         self.active_key = self.settings.get('active_page')
         if self.active_key not in ('wrist', 'astra'):
             self.active_key = 'astra'
@@ -280,6 +282,14 @@ class CameraConsole(tk.Tk):
             status = label(frame, '○  Waiting to connect', 8, MUTED, bg=SIDE, anchor='w')
             status.pack(fill='x', padx=17, pady=(4, 7))
             self.nav_status[key] = status
+        record_frame = tk.Frame(side, bg=SIDE)
+        record_frame.pack(fill='x', padx=14, pady=5)
+        record_nav = tk.Button(record_frame, text='示范录制', anchor='w', relief='flat', bd=0,
+                               bg=SIDE, fg=MUTED, activebackground='#1a3046', activeforeground=TEXT,
+                               font=(FONT, 11, 'bold'), padx=17, pady=14, cursor='hand2',
+                               command=lambda: self.show_page('record'))
+        record_nav.pack(fill='x')
+        self.nav_buttons['record'] = record_nav
         bottom = tk.Frame(side, bg=SIDE)
         bottom.pack(side='bottom', fill='x', padx=25, pady=28)
         label(bottom, 'Local camera workspace', 9, bg=SIDE).pack(anchor='w')
@@ -303,6 +313,8 @@ class CameraConsole(tk.Tk):
             page = CameraPage(container, self, definition)
             page.grid(row=0, column=0, sticky='nsew')
             self.pages[definition['key']] = page
+        self.pages['record'] = RecordingPage(container, self)
+        self.pages['record'].grid(row=0, column=0, sticky='nsew')
         self.toast_label = label(main, 'Independent camera connections. Switch views with Ctrl+1 / Ctrl+2.', 8, MUTED, anchor='w')
         self.toast_label.grid(row=2, column=0, sticky='ew', pady=(20, 0))
 
@@ -312,7 +324,7 @@ class CameraConsole(tk.Tk):
         self.pages[key].mark_dirty()
         for name, nav in self.nav_buttons.items():
             nav.configure(bg='#20374c' if name == key else SIDE, fg=TEXT if name == key else MUTED)
-        if persist:
+        if persist and key in ('wrist', 'astra'):
             try:
                 self.settings.save(active_page=key)
             except OSError:
@@ -323,6 +335,9 @@ class CameraConsole(tk.Tk):
             stream.start()
 
     def connect(self, key):
+        if self.pages['record'].busy:
+            self.toast('录制期间不能重连或更换相机，请先结束录制。')
+            return
         value = self.pages[key].source_value.get().strip()
         if key == 'wrist' and not validate_rtsp_url(value):
             messagebox.showinfo('Check the stream URL', 'Enter a valid RTSP URL, for example:\nrtsp://192.168.1.10/color', parent=self)
@@ -340,6 +355,9 @@ class CameraConsole(tk.Tk):
         self.pages[key].mark_dirty()
 
     def disconnect(self, key):
+        if self.pages['record'].busy:
+            self.toast('录制期间不能断开相机，请先结束录制。')
+            return
         self.streams[key].stop()
 
     def discover_cameras(self):
@@ -373,15 +391,25 @@ class CameraConsole(tk.Tk):
                 self.toast('Device discovery is unavailable. Existing connections remain active.')
         except queue.Empty:
             pass
+        camera_infos = {}
         for key, stream in self.streams.items():
             info = stream.poll()
+            camera_infos[key] = info
             self.pages[key].update_stream(info, key == self.active_key)
             state = info.get('state', 'stopped')
             status = '●  Connected' if state == 'streaming' else '○  Disconnected' if state == 'stopped' else '○  Connecting' if state == 'connecting' else '○  Waiting to connect'
             self.nav_status[key].configure(text=status, fg=GREEN if state == 'streaming' else MUTED)
-        self.after(40, self.tick)
+        self.pages['record'].update_recording(camera_infos, self.active_key == 'record')
+        if not self._closing:
+            self.after(40, self.tick)
 
     def on_close(self):
+        if self._closing or self._close_pending:
+            return
+        self._close_pending = True
+        self.pages['record'].request_close(self._finish_close)
+
+    def _finish_close(self):
         if self._closing:
             return
         self._closing = True

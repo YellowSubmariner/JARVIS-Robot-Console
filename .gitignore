@@ -31,3 +31,9 @@ screenshots/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local demonstration recordings
+/recordings/
+*_检查_*/
+*.npz
+*.parquet

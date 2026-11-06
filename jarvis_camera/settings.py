@@ -14,6 +14,8 @@ DEFAULTS = {
     'active_page': 'astra',
     'wrist_url': 'rtsp://192.168.1.10/color',
     'astra_name': 'Astra Pro HD Camera',
+    # User-selected interpreter with the matching Kinova SDK. Empty until set.
+    'kortex_python': '',
 }
 
 

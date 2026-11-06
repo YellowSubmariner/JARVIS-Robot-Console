@@ -82,7 +82,8 @@ def _put_latest(target_queue, value) -> None:
         pass
 
 
-def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None:
+def _capture_worker(config: dict, stop_event, frame_queue, status_queue,
+                    record_command_queue, record_status_queue) -> None:
     # FFmpeg options are process-local: a slow/unavailable wrist camera cannot
     # block the independent USB process or the Tk event loop.
     os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
@@ -90,6 +91,33 @@ def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
     retry_seconds = max(2.0, float(config.get("retry_seconds", 5.0)))
     maximum_fps = max(1.0, min(60.0, float(config.get("max_fps", 24.0))))
+    from .frame_recorder import FrameRecorder, _utc_now
+    recorder = None
+
+    def recording_status(value: dict) -> None:
+        # Unlike preview frames, recording status must not discard old events.
+        record_status_queue.put(value)
+
+    def recording_commands(*, allow_start: bool = True) -> None:
+        nonlocal recorder
+        while True:
+            try:
+                command = record_command_queue.get_nowait()
+            except queue.Empty:
+                return
+            if command.get("command") == "start":
+                if not allow_start:
+                    recording_status({"state": "error", "message": "Camera is disconnected; recording was not started."})
+                    continue
+                if recorder is not None and recorder.running:
+                    recording_status({"state": "error", "message": "Previous recording is still finishing."})
+                    continue
+                try:
+                    recorder = FrameRecorder(command["episode_dir"], command["camera_name"], recording_status)
+                except Exception:
+                    recording_status({"state": "error", "message": "Cannot start recording; check output directory and disk."})
+            elif command.get("command") == "stop" and recorder is not None:
+                recorder.finish()
 
     def status(state: str, message: str) -> None:
         _put_latest(status_queue, {"state": state, "message": message, "at": time.time()})
@@ -108,6 +136,7 @@ def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None
     capture = None
     try:
         while not stop_event.is_set():
+            recording_commands(allow_start=False)
             status("connecting" if first_attempt else "reconnecting", "Connecting to camera…")
             first_attempt = False
             try:
@@ -147,8 +176,14 @@ def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None
                 sent_streaming_status = False
                 missed_frames = 0
                 while not stop_event.is_set():
+                    recording_commands()
                     ok, frame = capture.read()
+                    # This is the host receipt time, not camera exposure time.
+                    received_ns = time.perf_counter_ns()
+                    received_utc = _utc_now()
                     if not ok or frame is None:
+                        if recorder is not None and recorder.accepting:
+                            recorder.note_read_failure(received_ns, received_utc)
                         missed_frames += 1
                         if config["kind"] == "rtsp" or missed_frames >= 6:
                             raise _CameraProblem("Video was interrupted. Check the camera connection.")
@@ -156,6 +191,10 @@ def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None
                             break
                         continue
                     missed_frames = 0
+                    # Recording is independent of the deliberately lossy preview
+                    # queue and happens before preview throttling.
+                    if recorder is not None and recorder.accepting:
+                        recorder.submit(frame, received_ns, received_utc)
                     now = time.monotonic()
                     recent_times.append(now)
                     if now < next_send:
@@ -182,8 +221,12 @@ def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None
                         "frames": frame_count,
                     })
             except _CameraProblem as exc:
+                if recorder is not None and recorder.accepting:
+                    recorder.abort("Camera stream disconnected during recording.")
                 status("reconnecting", f"{exc} Retrying in {retry_seconds:g} seconds.")
             except Exception:
+                if recorder is not None and recorder.accepting:
+                    recorder.abort("Camera capture failed during recording.")
                 # In particular, never put an exception containing an RTSP URL
                 # (possibly with credentials) into application status text.
                 status("reconnecting", f"Camera connection failed. Retrying in {retry_seconds:g} seconds.")
@@ -194,6 +237,9 @@ def _capture_worker(config: dict, stop_event, frame_queue, status_queue) -> None
             if stop_event.wait(retry_seconds):
                 break
     finally:
+        if recorder is not None and recorder.running:
+            recorder.abort("Camera was stopped during recording.")
+            recorder.join(3.0)
         if capture is not None:
             capture.release()
         # A large unread frame must not keep a child alive during shutdown.
@@ -206,6 +252,8 @@ class _ProcessHandle:
     stop_event: Any
     frame_queue: Any
     status_queue: Any
+    record_command_queue: Any
+    record_status_queue: Any
 
 
 def _shutdown_handle(handle: _ProcessHandle) -> None:
@@ -213,7 +261,7 @@ def _shutdown_handle(handle: _ProcessHandle) -> None:
     try:
         handle.stop_event.set()
         if handle.process.pid is not None:
-            handle.process.join(0.35)
+            handle.process.join(3.5)
             if handle.process.is_alive():
                 handle.process.terminate()
                 handle.process.join(0.35)
@@ -221,7 +269,7 @@ def _shutdown_handle(handle: _ProcessHandle) -> None:
                 handle.process.kill()
                 handle.process.join(0.35)
     finally:
-        for target in (handle.frame_queue, handle.status_queue):
+        for target in (handle.frame_queue, handle.status_queue, handle.record_command_queue, handle.record_status_queue):
             try:
                 target.cancel_join_thread()
                 target.close()
@@ -252,6 +300,7 @@ class CameraStream:
             "state": "stopped", "message": "Camera disconnected", "frame": None,
             "fps": 0.0, "width": 0, "height": 0,
             "last_frame_at": None, "frames": 0,
+            "recording": {"state": "idle", "message": "Not recording", "written": 0, "dropped": 0},
         }
         self._state_changed_at = time.time()
 
@@ -268,14 +317,18 @@ class CameraStream:
         self._values.update(state="connecting", message="Connecting to camera…")
         frame_queue = self._context.Queue(maxsize=2)
         status_queue = self._context.Queue(maxsize=8)
+        record_command_queue = self._context.Queue()
+        record_status_queue = self._context.Queue()
         stop_event = self._context.Event()
         process = self._context.Process(
             target=_capture_worker,
-            args=(dict(self.config), stop_event, frame_queue, status_queue),
+            args=(dict(self.config), stop_event, frame_queue, status_queue,
+                  record_command_queue, record_status_queue),
             daemon=True,
             name=f"jarvis-camera-{self.config['kind']}",
         )
-        handle = _ProcessHandle(process, stop_event, frame_queue, status_queue)
+        handle = _ProcessHandle(process, stop_event, frame_queue, status_queue,
+                                record_command_queue, record_status_queue)
         try:
             process.start()
         except Exception:
@@ -300,6 +353,27 @@ class CameraStream:
             self.config = dict(config)
         self.start()
 
+    def start_recording(self, episode_dir, camera_name: str) -> None:
+        """Request timestamped frame recording without opening another camera."""
+        handle = self._handle
+        if handle is None or self._values.get("state") != "streaming":
+            raise RuntimeError("Camera must be streaming before recording.")
+        if self._values.get("recording", {}).get("state") in ("starting", "recording", "stopping"):
+            raise RuntimeError("Camera recording is already active or finishing.")
+        if camera_name not in ("top", "wrist"):
+            raise ValueError("Unsupported recording camera name.")
+        self._values["recording"] = {"state": "starting", "message": "Starting recording", "written": 0, "dropped": 0}
+        handle.record_command_queue.put({"command": "start", "episode_dir": str(episode_dir), "camera_name": camera_name})
+
+    def stop_recording(self) -> None:
+        """Request an asynchronous flush; poll for 'complete' or 'error'."""
+        handle = self._handle
+        state = self._values.get("recording", {}).get("state")
+        if handle is None or state not in ("starting", "recording"):
+            return
+        self._values["recording"].update(state="stopping", message="Finishing recording")
+        handle.record_command_queue.put({"command": "stop"})
+
     def poll(self) -> dict:
         """Drain queues and return current status plus at most one new BGR frame."""
         self._values["frame"] = None
@@ -307,6 +381,21 @@ class CameraStream:
         if handle is None:
             return dict(self._values)
         broken_pipe = False
+        while True:
+            try:
+                recording = handle.record_status_queue.get_nowait()
+            except queue.Empty:
+                break
+            except (EOFError, OSError, ValueError):
+                broken_pipe = True
+                break
+            if (self._values.get("recording", {}).get("state") == "stopping"
+                    and recording.get("state") == "recording"):
+                continue
+            if (self._values.get("recording", {}).get("state") == "error"
+                    and recording.get("state") in ("recording", "complete")):
+                continue
+            self._values["recording"] = recording
         while True:
             try:
                 status = handle.status_queue.get_nowait()
@@ -344,6 +433,8 @@ class CameraStream:
                 pass
         if not handle.process.is_alive() and self._values["state"] != "error":
             self._values.update(state="error", message="The capture process stopped. Try reconnecting.")
+            if self._values.get("recording", {}).get("state") in ("starting", "recording", "stopping"):
+                self._values["recording"] = {"state": "error", "message": "Camera process stopped during recording.", "written": 0, "dropped": 0}
         return dict(self._values)
 
     def close(self) -> None:
