@@ -25,6 +25,7 @@ from PIL import Image, ImageTk
 
 from .credentials import CredentialStoreError, WindowsCredentialStore
 from .settings import app_directory
+from .typography import FONT
 
 BG = '#0a101b'
 CARD = '#111e30'
@@ -34,7 +35,6 @@ MUTED = '#91a3bc'
 CYAN = '#5ddac6'
 GREEN = '#7cddb0'
 AMBER = '#f4c779'
-FONT = 'Segoe UI'
 
 
 def _label(parent, text='', size=10, color=TEXT, bg=BG, bold=False, **kwargs):
@@ -82,8 +82,9 @@ class RecordingPage(tk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
         self.task = tk.StringVar(value='')
-        self.folder = tk.StringVar(value=str(app_directory() / 'recordings'))
         settings = getattr(app, 'settings', None)
+        self.folder = tk.StringVar(value=(settings.get('recordings_dir') if settings is not None
+                                         else '') or str(app_directory() / 'recordings'))
         self.python_path = tk.StringVar(value=settings.get('kortex_python') if settings is not None else '')
         self.robot_ip = tk.StringVar(value='192.168.1.10')
         self.robot_user = tk.StringVar(value='admin')
@@ -170,6 +171,12 @@ class RecordingPage(tk.Frame):
         selected = filedialog.askdirectory(parent=self.app, title='选择示范数据保存目录')
         if selected:
             self.folder.set(selected)
+            settings = getattr(self.app, 'settings', None)
+            if settings is not None:
+                try:
+                    settings.save(recordings_dir=selected)
+                except OSError:
+                    self.status_text.set('本次保存位置已选择，但未能记住该位置。')
 
     def _choose_python(self):
         selected = filedialog.askopenfilename(parent=self.app, title='选择 Kortex 环境的 python.exe',
@@ -273,6 +280,11 @@ class RecordingPage(tk.Frame):
 
     def start(self):
         if self.busy:
+            return
+        library = getattr(self.app, 'pages', {}).get('library')
+        if library is not None and getattr(library, 'exporting', False):
+            messagebox.showinfo('数据正在导出', '请等待本次导出完成后再开始录制，避免磁盘写入相互影响。',
+                                parent=self.app)
             return
         task = self.task.get().strip()
         if not task or len(task) > 500:
@@ -472,7 +484,8 @@ class RecordingPage(tk.Frame):
             self._write_manifest()
         except OSError:
             complete = False
-        self.status_text.set('录制已保存，等待回放检查。' if complete else '录制未完整结束，请检查本次数据。')
+        self.status_text.set('已保存，正在自动整理；任务已保留，可以继续录下一条。'
+                             if complete else '录制未完整结束，原始数据已保留，请在样本库检查。')
         details = ''
         if self.manifest.get('failure_reason') in ('robot_recorder_error', 'robot_connection_timeout'):
             details += ' 未能连接机器人，请检查地址、网络及密码；可点击“设置密码”更新。'
@@ -484,11 +497,19 @@ class RecordingPage(tk.Frame):
             details += ' 相机记录存在掉帧或读帧错误。'
         details += self._joint_safety_message()
         self.details_text.set(details)
-        # Each episode needs an explicit task, even when a previous run was stopped.
-        self.task.set('')
+        # Repeated demonstrations share a task. The immutable episode manifest
+        # already captured its text at start; changing the next task cannot edit it.
         self.state = 'idle'
         self.robot_process = None
         self._set_controls()
+        # Notify on the Tk thread only after all raw workers have finished.
+        # A close request preserves raw files and leaves preparation for next launch.
+        on_saved = getattr(self.app, 'on_episode_saved', None)
+        if on_saved is not None and not forced and self.close_callback is None:
+            try:
+                on_saved(self.episode)
+            except (OSError, ValueError, RuntimeError):
+                self.status_text.set('录制已保存，可在样本库中重新整理。')
         if self.close_callback is not None:
             callback, self.close_callback = self.close_callback, None
             callback()

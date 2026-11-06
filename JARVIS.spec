@@ -9,7 +9,9 @@ analysis = Analysis(
     [str(root / 'main.py')],
     pathex=[str(root)],
     binaries=camera_binaries,
-    datas=camera_data + [(str(root / 'assets'), 'assets'), (str(root / 'jarvis_camera' / 'robot_recorder.py'), 'jarvis_camera')],
+    datas=camera_data + [(str(root / 'assets'), 'assets'),
+                        (str(root / 'jarvis_camera' / 'robot_recorder.py'), 'jarvis_camera'),
+                        (str(root / 'jarvis_camera' / 'lerobot_export_worker.py'), 'jarvis_camera')],
     hiddenimports=camera_hidden,
 )
 archive = PYZ(analysis.pure)

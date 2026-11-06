@@ -16,6 +16,8 @@ DEFAULTS = {
     'astra_name': 'Astra Pro HD Camera',
     # User-selected interpreter with the matching Kinova SDK. Empty until set.
     'kortex_python': '',
+    'recordings_dir': '',
+    'dataset_python': '',
 }
 
 

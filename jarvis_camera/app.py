@@ -15,7 +15,9 @@ from PIL import Image, ImageEnhance, ImageTk
 
 from .capture import CameraStream, enumerate_usb_cameras
 from .recording_page import RecordingPage
+from .dataset_page import DatasetPage
 from .settings import Settings, app_directory, validate_rtsp_url
+from .typography import FONT, configure_typography
 
 BG = '#0a101b'
 SIDE = '#101a29'
@@ -26,7 +28,6 @@ MUTED = '#91a3bc'
 CYAN = '#5ddac6'
 GREEN = '#7cddb0'
 AMBER = '#f4c779'
-FONT = 'Segoe UI'
 
 PAGE_DEFINITIONS = (
     {'key': 'wrist', 'title': 'Wrist Camera', 'subtitle': 'See the workspace from the gripper perspective.', 'tag': 'KINOVA GEN3', 'kind': 'rtsp'},
@@ -77,7 +78,7 @@ class CameraPage(tk.Frame):
         self.source_value = tk.StringVar(value=app.settings.get('wrist_url' if self.key == 'wrist' else 'astra_name'))
         if self.key == 'wrist':
             self.source_input = tk.Entry(source_card, textvariable=self.source_value, bg='#0b1524', fg=TEXT,
-                insertbackground=CYAN, relief='flat', font=('Consolas', 11), bd=8)
+                insertbackground=CYAN, relief='flat', font=(FONT, 11), bd=8)
             self.source_input.bind('<Return>', lambda _event: self.app.connect(self.key))
         else:
             self.source_input = ttk.Combobox(source_card, textvariable=self.source_value,
@@ -186,7 +187,7 @@ class CameraPage(tk.Frame):
                 self.canvas.create_text(18, height - 20, text='Last received frame shown. Video is not updating.', fill=AMBER, anchor='w', font=(FONT, 9))
         else:
             self.canvas.create_rectangle(16, 16, 86, 42, fill='#10382d', outline='')
-            self.canvas.create_text(51, 29, text='● LIVE', fill=GREEN, font=('Segoe UI', 10, 'bold'))
+            self.canvas.create_text(51, 29, text='● LIVE', fill=GREEN, font=(FONT, 10, 'bold'))
         self._dirty = False
 
     def save_snapshot(self):
@@ -243,6 +244,7 @@ class CameraConsole(tk.Tk):
     def _init_style(self):
         style = ttk.Style(self)
         style.theme_use('clam')
+        configure_typography(self, style)
         style.configure('Source.TCombobox', fieldbackground='#0b1524', background='#243b56',
                         foreground=TEXT, arrowcolor=TEXT, borderwidth=0, padding=8, font=(FONT, 10))
         style.map('Source.TCombobox', fieldbackground=[('readonly', '#0b1524')],
@@ -290,10 +292,18 @@ class CameraConsole(tk.Tk):
                                command=lambda: self.show_page('record'))
         record_nav.pack(fill='x')
         self.nav_buttons['record'] = record_nav
+        library_frame = tk.Frame(side, bg=SIDE)
+        library_frame.pack(fill='x', padx=14, pady=5)
+        library_nav = tk.Button(library_frame, text='样本库', anchor='w', relief='flat', bd=0,
+                                bg=SIDE, fg=MUTED, activebackground='#1a3046', activeforeground=TEXT,
+                                font=(FONT, 11, 'bold'), padx=17, pady=14, cursor='hand2',
+                                command=lambda: self.show_page('library'))
+        library_nav.pack(fill='x')
+        self.nav_buttons['library'] = library_nav
         bottom = tk.Frame(side, bg=SIDE)
         bottom.pack(side='bottom', fill='x', padx=25, pady=28)
         label(bottom, 'Local camera workspace', 9, bg=SIDE).pack(anchor='w')
-        label(bottom, 'JARVIS  /  v0.1.0', 8, MUTED, bg=SIDE).pack(anchor='w', pady=(6, 0))
+        label(bottom, 'JARVIS  /  DATA PREVIEW', 8, MUTED, bg=SIDE).pack(anchor='w', pady=(6, 0))
 
         main = tk.Frame(self, bg=BG, padx=30, pady=25)
         main.grid(row=0, column=1, sticky='nsew')
@@ -315,6 +325,8 @@ class CameraConsole(tk.Tk):
             self.pages[definition['key']] = page
         self.pages['record'] = RecordingPage(container, self)
         self.pages['record'].grid(row=0, column=0, sticky='nsew')
+        self.pages['library'] = DatasetPage(container, self)
+        self.pages['library'].grid(row=0, column=0, sticky='nsew')
         self.toast_label = label(main, 'Independent camera connections. Switch views with Ctrl+1 / Ctrl+2.', 8, MUTED, anchor='w')
         self.toast_label.grid(row=2, column=0, sticky='ew', pady=(20, 0))
 
@@ -400,6 +412,7 @@ class CameraConsole(tk.Tk):
             status = '●  Connected' if state == 'streaming' else '○  Disconnected' if state == 'stopped' else '○  Connecting' if state == 'connecting' else '○  Waiting to connect'
             self.nav_status[key].configure(text=status, fg=GREEN if state == 'streaming' else MUTED)
         self.pages['record'].update_recording(camera_infos, self.active_key == 'record')
+        self.pages['library'].update_library()
         if not self._closing:
             self.after(40, self.tick)
 
@@ -407,7 +420,11 @@ class CameraConsole(tk.Tk):
         if self._closing or self._close_pending:
             return
         self._close_pending = True
-        self.pages['record'].request_close(self._finish_close)
+        self.pages['record'].request_close(
+            lambda: self.pages['library'].request_close(self._finish_close))
+
+    def on_episode_saved(self, episode):
+        self.pages['library'].enqueue_episode(episode)
 
     def _finish_close(self):
         if self._closing:

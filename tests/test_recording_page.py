@@ -63,7 +63,7 @@ class RecordingPageTests(unittest.TestCase):
             self.assertIn('Kortex Python', info.call_args.args[0])
             password.assert_not_called()
 
-    def test_task_must_be_chosen_for_each_episode(self):
+    def test_task_is_retained_for_repeated_demonstrations(self):
         self.assertEqual(self.page.task.get(), '')
         self.page.task.set('把红色积木放到盒子里')
         self.page.state = 'stopping'
@@ -72,7 +72,41 @@ class RecordingPageTests(unittest.TestCase):
         self.page.robot_counts = {'feedback_samples': 3}
         self.page.camera_infos = self.cameras('complete')
         self.page._finalize()
-        self.assertEqual(self.page.task.get(), '')
+        self.assertEqual(self.page.task.get(), '把红色积木放到盒子里')
+
+    def test_finalized_episode_queues_preparation_after_recording_becomes_idle(self):
+        saved = []
+        self.app.on_episode_saved = lambda path: saved.append((path, self.page.state))
+        self.page.state = 'stopping'
+        self.page.pending_outcome = 'success'
+        self.page.robot_state = 'stopped'
+        self.page.robot_counts = {'feedback_samples': 3}
+        self.page.camera_infos = self.cameras('complete')
+        self.page._finalize()
+        self.assertEqual(saved, [(self.episode, 'idle')])
+        self.assertFalse(self.page.manifest['training_ready'])
+
+    def test_closing_does_not_queue_another_preparation(self):
+        saved, closed = [], []
+        self.app.on_episode_saved = saved.append
+        self.page.close_callback = lambda: closed.append(True)
+        self.page.state = 'stopping'
+        self.page.pending_outcome = 'success'
+        self.page.robot_state = 'stopped'
+        self.page.robot_counts = {'feedback_samples': 3}
+        self.page.camera_infos = self.cameras('complete')
+        self.page._finalize()
+        self.assertEqual(saved, [])
+        self.assertEqual(closed, [True])
+
+    def test_heavy_export_prevents_start_before_password_or_hardware_access(self):
+        self.app.pages = {'library': SimpleNamespace(exporting=True)}
+        with patch('jarvis_camera.recording_page.messagebox.showinfo') as info, \
+             patch.object(self.page, '_recording_password') as password:
+            self.page.start()
+            self.assertIn('导出', info.call_args.args[0])
+            password.assert_not_called()
+        self.assertFalse(self.app.streams['astra'].started)
 
     def test_password_is_asked_once_then_loaded_for_next_recordings(self):
         class FakeStore:
