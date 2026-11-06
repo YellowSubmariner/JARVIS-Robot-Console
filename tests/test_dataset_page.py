@@ -66,7 +66,7 @@ class LibraryFileTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     safe_image_path(episode, path)
             (episode / 'inside.jpg').write_bytes(b'test')
-            self.assertEqual(safe_image_path(episode, 'inside.jpg'), episode / 'inside.jpg')
+            self.assertEqual(safe_image_path(episode, 'inside.jpg'), (episode / 'inside.jpg').resolve())
 
     def test_bad_metadata_is_visible_not_a_valid_sample(self):
         with tempfile.TemporaryDirectory() as folder:

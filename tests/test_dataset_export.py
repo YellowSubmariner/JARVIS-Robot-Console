@@ -50,7 +50,8 @@ class FakeDataset:
 class DatasetExportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        # Windows TEMP may use an 8.3 alias; match the canonical keys used below.
+        self.root = Path(self.temp.name).resolve()
         self.prepared = {}
         self.episodes = [self.make_episode(i) for i in range(3)]
         self.loader = patch('jarvis_camera.dataset_export.load_prepared_episode', side_effect=self.load)
