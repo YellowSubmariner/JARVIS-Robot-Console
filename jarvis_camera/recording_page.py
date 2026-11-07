@@ -283,7 +283,7 @@ class RecordingPage(tk.Frame):
             return
         library = getattr(self.app, 'pages', {}).get('library')
         if library is not None and getattr(library, 'exporting', False):
-            messagebox.showinfo('数据正在导出', '请等待本次导出完成后再开始录制，避免磁盘写入相互影响。',
+            messagebox.showinfo('数据正在处理', '请等待导出、删除或恢复完成后再开始录制，避免文件操作相互影响。',
                                 parent=self.app)
             return
         task = self.task.get().strip()

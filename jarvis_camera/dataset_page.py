@@ -98,6 +98,17 @@ def safe_image_path(episode: Path, relative: str) -> Path:
     return resolved
 
 
+def recovery_initial_dir(last_item, recordings_root: Path) -> Path:
+    """Prefer this session's recoverable item, then the recording recovery area."""
+    if last_item:
+        item = Path(last_item)
+        if item.is_dir():
+            return item
+    root = Path(recordings_root)
+    area = root / '.jarvis_trash'
+    return area if area.is_dir() else root
+
+
 def _run_conversion_worker(worker: Path, arguments: list[str], python: Path, progress) -> dict:
     """Run the worker's JSON progress protocol without opening a window."""
     if not python.is_file() or not worker.is_file():
@@ -260,6 +271,17 @@ def perform_job(kind: str, payload: dict, progress) -> object:
         return run_conversion(payload['bundle'], payload['output'], payload['python'], progress)
     if kind == 'check_env':
         return check_conversion_environment(payload['python'])
+    if kind in ('trash_episode', 'trash_dataset', 'restore_trash'):
+        from .trash_manager import (move_episode_to_trash, move_dataset_to_trash,
+                                    restore_from_trash)
+        protected = payload.get('protected_paths', ())
+        if kind == 'trash_episode':
+            return move_episode_to_trash(payload['path'], payload['recordings_root'],
+                                         protected_paths=protected)
+        if kind == 'trash_dataset':
+            return move_dataset_to_trash(payload['path'], payload['recordings_root'],
+                                         protected_paths=protected)
+        return restore_from_trash(payload['path'], protected_paths=protected)
     if kind == 'direct_export':
         from .dataset_export import export_bundle
         output = Path(payload['output'])
@@ -314,6 +336,7 @@ class DatasetPage(tk.Frame):
         self._preview_after = None
         self._current_approved = False
         self._last_bundle = None
+        self._last_trash_item = None
         self._dataset_python = self._saved_dataset_python()
         self._dataset_prior = self._saved_prior_export()
         self.environment_text = tk.StringVar(value=self._environment_description())
@@ -333,8 +356,9 @@ class DatasetPage(tk.Frame):
 
     @property
     def exporting(self):
-        return bool((self._active and self._active['kind'] in ('export', 'convert', 'direct_export'))
-                    or any(job['kind'] in ('export', 'convert', 'direct_export') for job in self._jobs))
+        blocking = ('export', 'convert', 'direct_export', 'trash_episode', 'trash_dataset', 'restore_trash')
+        return bool((self._active and self._active['kind'] in blocking)
+                    or any(job['kind'] in blocking for job in self._jobs))
 
     def _recording_busy(self):
         record = getattr(self.app, 'pages', {}).get('record')
@@ -427,6 +451,15 @@ class DatasetPage(tk.Frame):
             bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
             selectcolor=CARD, font=(FONT, 9), anchor='w')
         self.rebuild_check.pack(side='left')
+        removal_options = tk.Frame(folders, bg=BG)
+        removal_options.pack(fill='x', pady=(3, 0))
+        self.trash_episode_button = self._button(removal_options, '删除选中示范', self._trash_episode)
+        self.trash_dataset_button = self._button(removal_options, '删除导出数据集', self._trash_dataset)
+        self.restore_trash_button = self._button(removal_options, '恢复已删除数据', self._restore_trash)
+        for widget in (self.trash_episode_button, self.trash_dataset_button, self.restore_trash_button):
+            widget.pack(side='left', padx=(0, 7))
+        self._label(removal_options, '移入软件回收区，可恢复；暂不释放空间',
+                    size=9, color=MUTED).pack(side='left')
 
         body = tk.PanedWindow(self, orient='horizontal', bg=BG, bd=0,
                               sashwidth=7, sashrelief='flat')
@@ -582,6 +615,9 @@ class DatasetPage(tk.Frame):
         self.check_env_button.configure(state='normal' if idle and not recording else 'disabled')
         self.choose_prior_button.configure(state='normal' if idle and not recording else 'disabled')
         self.rebuild_check.configure(state='normal' if idle and not recording else 'disabled')
+        self.trash_episode_button.configure(state='normal' if idle and selected and not recording else 'disabled')
+        self.trash_dataset_button.configure(state='normal' if idle and not recording else 'disabled')
+        self.restore_trash_button.configure(state='normal' if idle and not recording else 'disabled')
         view_ready = bool(idle and self._rows and self._view_episode == selected)
         for widget in self.review_checks:
             widget.configure(state='normal' if view_ready else 'disabled')
@@ -620,7 +656,10 @@ class DatasetPage(tk.Frame):
                  'approve': '正在保存检查结果…', 'export': '正在导出已检查样本…',
                  'convert': '正在转换 LeRobot 数据…',
                  'direct_export': '正在直接导出 LeRobot 数据…',
-                 'check_env': '正在检查转换环境…'}
+                 'check_env': '正在检查转换环境…',
+                 'trash_episode': '正在将示范移入回收区…',
+                 'trash_dataset': '正在将数据集移入回收区…',
+                 'restore_trash': '正在恢复数据…'}
         self.status_text.set(verbs[job['kind']])
         self._thread = threading.Thread(target=self._work, args=(job,),
                                         name='dataset-' + job['kind'], daemon=True)
@@ -732,12 +771,100 @@ class DatasetPage(tk.Frame):
             if str(job['payload']['python']) == self._dataset_python:
                 self.environment_text.set('转换环境：依赖检查通过（实际转换仍需验证）  ' + self._dataset_python)
             self.status_text.set('转换环境检查通过：LeRobot 固定版本与基础依赖可导入。')
+        elif kind in ('trash_episode', 'trash_dataset'):
+            if kind == 'trash_episode' and self._view_episode == job['payload']['path']:
+                self._view_episode = None
+                self._rows = []
+                self._current_approved = False
+                for variable in self.review_vars.values():
+                    variable.set(False)
+                self.slider.configure(to=0)
+                self.sample_text.set('')
+                self.details_text.set('示范已移入回收区，可使用“恢复已删除数据”。')
+                self._schedule_preview()
+            location = str(result['trash_item'])
+            self._last_trash_item = Path(location)
+            self.status_text.set('已移入软件回收区，不会立即释放磁盘空间。回收位置：' + location)
+            messagebox.showinfo('已移入回收区',
+                '数据尚可恢复，也尚未释放磁盘空间。\n\n回收位置：\n' + location +
+                '\n\n可点击“恢复已删除数据”并选择该回收文件夹。', parent=self.app)
+        elif kind == 'restore_trash':
+            location = str(result['original_path'])
+            self._last_trash_item = None
+            self.status_text.set('数据已恢复到：' + location)
+            messagebox.showinfo('数据已恢复', '已恢复到原来的位置：\n' + location, parent=self.app)
 
     def _prepare_selected(self):
         selected = self._selected()
         if selected is None or self.busy or self._recording_busy():
             return
         self.enqueue_episode(selected)
+
+    def _protected_paths(self):
+        protected = [app_directory()]
+        for text in (self._dataset_python,
+                     getattr(getattr(self.app, 'pages', {}).get('record'), 'python_path', None)):
+            if hasattr(text, 'get'):
+                text = text.get()
+            if text:
+                path = Path(text).expanduser()
+                # A virtual environment's Python lives in its Scripts folder.
+                protected.append(path.parent.parent if path.parent.name.lower() == 'scripts' else path.parent)
+        return protected
+
+    def _trash_episode(self):
+        if self.busy or self._recording_busy() or self._closing:
+            return
+        path = self._selected()
+        if path is None:
+            messagebox.showinfo('先选择示范', '请在左侧选择要删除的单条示范。', parent=self.app)
+            return
+        entry = next((x for x in self.entries if x['path'] == path), None)
+        if entry is None:
+            return
+        outcome = {'success': '成功', 'failed': '失败', 'intervention': '人工介入',
+                   'incomplete': '未完整'}.get(entry.get('outcome'), '未知')
+        confirmed = messagebox.askyesno('删除这条原始示范？',
+            f"任务：{entry['task']}\n结果：{outcome}\n目录：{path}\n\n"
+            '将整条示范（原始图片、机器人反馈和检查结果）移入软件回收区，可恢复，暂不释放磁盘空间。'
+            '已导出的数据集不会自动改变；若要从之后的数据集中排除此示范，需要重新建立数据集。\n\n'
+            '请先在其他打开的软件版本中结束录制和处理。确定移入回收区吗？', parent=self.app)
+        if confirmed and not self.busy and not self._recording_busy() and not self._closing:
+            self._enqueue('trash_episode', {'path': path, 'recordings_root': self._recording_root(),
+                                            'protected_paths': self._protected_paths()})
+
+    def _trash_dataset(self):
+        if self.busy or self._recording_busy() or self._closing:
+            return
+        path = filedialog.askdirectory(title='选择要删除的已导出 LeRobot 数据集文件夹',
+                                       initialdir=str(self._recording_root().parent), parent=self.app)
+        if not path:
+            return
+        path = Path(path)
+        confirmed = messagebox.askyesno('删除这个导出数据集？',
+            f'数据集目录：{path}\n\n'
+            '仅将这个已导出数据集移入软件回收区，原始示范不会改变；可恢复，暂不释放磁盘空间。'
+            '若它是上次用于增量复用的数据集，之后需恢复它、选择其他已有数据集或重新建立。\n\n'
+            '请先在其他打开的软件版本中结束录制和处理。确定移入回收区吗？', parent=self.app)
+        if confirmed and not self.busy and not self._recording_busy() and not self._closing:
+            self._enqueue('trash_dataset', {'path': path, 'recordings_root': self._recording_root(),
+                                            'protected_paths': self._protected_paths()})
+
+    def _restore_trash(self):
+        if self.busy or self._recording_busy() or self._closing:
+            return
+        start = recovery_initial_dir(getattr(self, '_last_trash_item', None), self._recording_root())
+        path = filedialog.askdirectory(title='选择回收区内的编号记录文件夹或其中的 payload 文件夹',
+                                       initialdir=str(start), parent=self.app)
+        if not path:
+            return
+        path = Path(path)
+        confirmed = messagebox.askyesno('恢复这条回收记录？',
+            f'回收记录：{path}\n\n'
+            '数据将恢复到原来的位置；如果原位置已有内容，程序不会覆盖。'
+            '请先在其他打开的软件版本中结束录制和处理。', parent=self.app)
+        if confirmed and not self.busy and not self._recording_busy() and not self._closing:
+            self._enqueue('restore_trash', {'path': path, 'protected_paths': self._protected_paths()})
 
     def _load_selected(self):
         selected = self._selected()

@@ -104,7 +104,7 @@ class RecordingPageTests(unittest.TestCase):
         with patch('jarvis_camera.recording_page.messagebox.showinfo') as info, \
              patch.object(self.page, '_recording_password') as password:
             self.page.start()
-            self.assertIn('导出', info.call_args.args[0])
+            self.assertIn('处理', info.call_args.args[0])
             password.assert_not_called()
         self.assertFalse(self.app.streams['astra'].started)
 

@@ -16,7 +16,8 @@ from PIL import Image
 
 from jarvis_camera.dataset_page import (DatasetPage, scan_episodes, safe_image_path,
                                         run_conversion, run_incremental_conversion,
-                                        is_incremental_candidate, find_latest_incremental, perform_job)
+                                        is_incremental_candidate, find_latest_incremental, perform_job,
+                                        recovery_initial_dir)
 
 
 def write_json(path, value):
@@ -37,6 +38,128 @@ def make_episode(root, name='episode_1', reviewed=False):
                    'source_fingerprint': 'source123', 'prepared_signature': 'derived123',
                    'checks': {'alignment': True, 'position_targets': True, 'stable_end': True}})
     return episode
+
+
+class DeletionOrchestrationTests(unittest.TestCase):
+    """Deletion choices are explicit; no GUI or real user files are used."""
+
+    @staticmethod
+    def page(selected=None, busy=False, recording=False):
+        jobs = []
+        path = Path('fake-recordings') / 'episode-selected'
+        page = SimpleNamespace(
+            app=SimpleNamespace(), busy=busy, _closing=False,
+            entries=[{'path': path, 'task': '合成示范', 'outcome': 'failed'}],
+            _selected=lambda: selected,
+            _recording_busy=lambda: recording,
+            _recording_root=lambda: Path('fake-recordings'),
+            _protected_paths=lambda: [Path('fake-app')],
+            _enqueue=lambda kind, payload: jobs.append((kind, payload)),
+        )
+        return page, jobs, path
+
+    def test_sample_delete_requires_explicit_selection_and_confirmation(self):
+        page, jobs, selected = self.page()
+        with patch('jarvis_camera.dataset_page.messagebox.showinfo') as info, \
+             patch('jarvis_camera.dataset_page.messagebox.askyesno') as confirm:
+            DatasetPage._trash_episode(page)
+            info.assert_called_once()
+            confirm.assert_not_called()
+        self.assertEqual(jobs, [])
+        page._selected = lambda: selected
+        with patch('jarvis_camera.dataset_page.messagebox.askyesno', return_value=False) as confirm:
+            DatasetPage._trash_episode(page)
+            self.assertIn(str(selected), confirm.call_args.args[1])
+            self.assertIn('合成示范', confirm.call_args.args[1])
+            self.assertIn('结果：失败', confirm.call_args.args[1])
+            self.assertIn('暂不释放磁盘空间', confirm.call_args.args[1])
+        self.assertEqual(jobs, [])
+        with patch('jarvis_camera.dataset_page.messagebox.askyesno', return_value=True):
+            DatasetPage._trash_episode(page)
+        self.assertEqual(jobs[0][0], 'trash_episode')
+        self.assertEqual(jobs[0][1]['path'], selected)
+
+    def test_dataset_and_restore_require_explicit_path_and_confirmation(self):
+        page, jobs, _ = self.page()
+        with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value=''), \
+             patch('jarvis_camera.dataset_page.messagebox.askyesno') as confirm:
+            DatasetPage._trash_dataset(page)
+            DatasetPage._restore_trash(page)
+            confirm.assert_not_called()
+        self.assertEqual(jobs, [])
+        with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value='fake-dataset'), \
+             patch('jarvis_camera.dataset_page.messagebox.askyesno', return_value=False) as confirm:
+            DatasetPage._trash_dataset(page)
+            self.assertIn('fake-dataset', confirm.call_args.args[1])
+        self.assertEqual(jobs, [])
+        with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value='fake-dataset'), \
+             patch('jarvis_camera.dataset_page.messagebox.askyesno', return_value=True):
+            DatasetPage._trash_dataset(page)
+        self.assertEqual(jobs[0][0], 'trash_dataset')
+        self.assertEqual(jobs[0][1]['path'], Path('fake-dataset'))
+        with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value='fake-trash-item'), \
+             patch('jarvis_camera.dataset_page.messagebox.askyesno', return_value=True):
+            DatasetPage._restore_trash(page)
+        self.assertEqual(jobs[1][0], 'restore_trash')
+
+    def test_recording_and_other_processing_block_all_deletion_controls(self):
+        for busy, recording in ((True, False), (False, True)):
+            page, jobs, selected = self.page(busy=busy, recording=recording)
+            page._selected = lambda: selected
+            with patch('jarvis_camera.dataset_page.messagebox.askyesno') as confirm, \
+                 patch('jarvis_camera.dataset_page.filedialog.askdirectory') as dialog:
+                DatasetPage._trash_episode(page)
+                DatasetPage._trash_dataset(page)
+                DatasetPage._restore_trash(page)
+                confirm.assert_not_called()
+                dialog.assert_not_called()
+            self.assertEqual(jobs, [])
+
+    def test_queued_deletions_block_starting_a_recording(self):
+        for kind in ('trash_episode', 'trash_dataset', 'restore_trash'):
+            page = SimpleNamespace(_active={'kind': kind}, _jobs=[])
+            self.assertTrue(DatasetPage.exporting.fget(page))
+            page = SimpleNamespace(_active=None, _jobs=[{'kind': kind}])
+            self.assertTrue(DatasetPage.exporting.fget(page))
+
+    def test_recording_starting_during_confirmation_cancels_removal(self):
+        page, jobs, selected = self.page()
+        page._selected = lambda: selected
+        def begin_recording(*_args, **_kwargs):
+            page._recording_busy = lambda: True
+            return True
+        with patch('jarvis_camera.dataset_page.messagebox.askyesno', side_effect=begin_recording):
+            DatasetPage._trash_episode(page)
+        self.assertEqual(jobs, [])
+
+    def test_real_backend_receives_protected_paths(self):
+        root, episode, protected = Path('synthetic-root'), Path('synthetic-episode'), [Path('synthetic-app')]
+        with patch('jarvis_camera.trash_manager.move_episode_to_trash', return_value={'kind': 'episode'}) as move:
+            result = perform_job('trash_episode', {'path': episode, 'recordings_root': root,
+                                                    'protected_paths': protected}, lambda _event: None)
+            move.assert_called_once_with(episode, root, protected_paths=protected)
+            self.assertEqual(result['kind'], 'episode')
+
+    def test_restore_dialog_prefers_last_item_then_recording_trash(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            recordings = root / 'recordings'
+            recordings.mkdir()
+            self.assertEqual(recovery_initial_dir(None, recordings), recordings)
+            area = recordings / '.jarvis_trash'
+            area.mkdir()
+            self.assertEqual(recovery_initial_dir(None, recordings), area)
+            item = root / 'other' / '.jarvis_trash' / ('a' * 32)
+            item.mkdir(parents=True)
+            self.assertEqual(recovery_initial_dir(item, recordings), item)
+            page, jobs, _ = self.page()
+            page._last_trash_item = item
+            page._recording_root = lambda: recordings
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value='') as dialog:
+                DatasetPage._restore_trash(page)
+                self.assertEqual(dialog.call_args.kwargs['initialdir'], str(item))
+                self.assertIn('payload', dialog.call_args.kwargs['title'])
+            self.assertEqual(jobs, [])
 
 
 class LibraryFileTests(unittest.TestCase):
