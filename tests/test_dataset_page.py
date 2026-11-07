@@ -10,11 +10,11 @@ import time
 import tkinter as tk
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
-from jarvis_camera.dataset_page import DatasetPage, scan_episodes, safe_image_path, run_conversion
+from jarvis_camera.dataset_page import DatasetPage, scan_episodes, safe_image_path, run_conversion, perform_job
 
 
 def write_json(path, value):
@@ -38,6 +38,113 @@ def make_episode(root, name='episode_1', reviewed=False):
 
 
 class LibraryFileTests(unittest.TestCase):
+    def test_conversion_python_detects_sibling_environment_without_overriding_choice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            app = root / 'JARVIS-Robot-Console'
+            python = root / 'JARVIS-LeRobot-Environment' / 'Scripts' / 'python.exe'
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b'placeholder')
+            settings = SimpleNamespace(get=lambda _key: '')
+            page = SimpleNamespace(app=SimpleNamespace(settings=settings))
+            with patch('jarvis_camera.dataset_page.app_directory', return_value=app):
+                self.assertEqual(DatasetPage._saved_dataset_python(page), str(python))
+                settings.get = lambda _key: str(root / 'custom' / 'python.exe')
+                self.assertEqual(DatasetPage._saved_dataset_python(page), str(root / 'custom' / 'python.exe'))
+                settings.get = lambda _key: ''
+                python.unlink()
+                self.assertEqual(DatasetPage._saved_dataset_python(page), '')
+
+    def test_one_click_selects_only_reviewed_successful_candidates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            python = root / 'python.exe'
+            python.write_bytes(b'placeholder')
+            episodes = [root / f'episode{i}' for i in range(3)]
+            page = SimpleNamespace(
+                busy=False, _closing=False, _recording_busy=lambda: False,
+                _dataset_python=str(python), app=object(), status_text=Mock(),
+                refresh=Mock(), entries=[{'path': p, 'reviewed': True} for p in episodes] +
+                                         [{'path': root / 'unreviewed', 'reviewed': False}],
+                _recording_root=lambda: root / 'recordings', _enqueue=Mock())
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value=str(root)) as chooser:
+                DatasetPage._direct_export(page)
+            chooser.assert_called_once()
+            kind, payload = page._enqueue.call_args.args
+            self.assertEqual(kind, 'direct_export')
+            self.assertEqual(payload['episodes'], episodes)
+            self.assertEqual(payload['python'], python)
+            self.assertFalse(payload['output'].exists())
+            self.assertTrue(payload['output'].name.startswith('lerobot_'))
+
+    def test_one_click_blocks_during_recording_and_for_unreviewed_samples(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            python = root / 'python.exe'
+            python.write_bytes(b'placeholder')
+            page = SimpleNamespace(busy=False, _closing=False, _recording_busy=lambda: True,
+                                   _dataset_python=str(python), app=object(), status_text=Mock(),
+                                   refresh=Mock(), entries=[], _enqueue=Mock())
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory') as chooser:
+                DatasetPage._direct_export(page)
+                chooser.assert_not_called()
+            page._recording_busy = lambda: False
+            page.entries = [{'path': root / str(i), 'reviewed': i != 2} for i in range(3)]
+            with patch('jarvis_camera.dataset_page.messagebox.showinfo') as info, \
+                 patch('jarvis_camera.dataset_page.filedialog.askdirectory') as chooser:
+                DatasetPage._direct_export(page)
+                info.assert_called_once()
+                chooser.assert_not_called()
+                page._enqueue.assert_not_called()
+
+    def test_direct_export_uses_temporary_bundle_and_removes_it_on_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            source = root / 'raw'
+            source.mkdir()
+            (source / 'keep.txt').write_text('original', encoding='utf-8')
+            output = root / 'lerobot-output'
+            python = root / 'python.exe'
+            python.write_bytes(b'placeholder')
+            payload = {'episodes': [source], 'output': output, 'python': python}
+            seen = []
+            def export(episodes, bundle, *, seed, progress):
+                self.assertEqual(episodes, [source])
+                bundle.mkdir()
+                (bundle / 'bundle.json').write_text('{}', encoding='utf-8')
+                seen.append(bundle)
+            def convert(bundle, out, selected_python, progress):
+                self.assertTrue((bundle / 'bundle.json').is_file())
+                self.assertEqual(selected_python, python)
+                self.assertEqual(out, output)
+                out.mkdir()
+                return {'output_dir': str(out)}
+            with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
+                 patch('jarvis_camera.dataset_export.export_bundle', side_effect=export), \
+                 patch('jarvis_camera.dataset_page.run_conversion', side_effect=convert):
+                self.assertEqual(perform_job('direct_export', payload, lambda _event: None)['output_dir'], str(output))
+            self.assertFalse(seen[0].parent.exists())
+            self.assertEqual((source / 'keep.txt').read_text(encoding='utf-8'), 'original')
+            self.assertTrue(output.is_dir())
+            payload['output'] = root / 'failed-output'
+            with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
+                 patch('jarvis_camera.dataset_export.export_bundle', side_effect=export), \
+                 patch('jarvis_camera.dataset_page.run_conversion', side_effect=ValueError('failure')):
+                with self.assertRaisesRegex(ValueError, 'failure'):
+                    perform_job('direct_export', payload, lambda _event: None)
+            self.assertFalse(seen[1].parent.exists())
+            self.assertFalse(payload['output'].exists())
+            self.assertTrue(output.is_dir())
+
+    def test_direct_export_refuses_existing_output_before_starting(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            payload = {'episodes': [], 'output': root, 'python': root / 'python.exe'}
+            with patch('jarvis_camera.dataset_page.check_conversion_environment') as check:
+                with self.assertRaises(FileExistsError):
+                    perform_job('direct_export', payload, lambda _event: None)
+                check.assert_not_called()
+
     def test_page_preserves_tk_widget_methods(self):
         overrides = {name for name, value in vars(DatasetPage).items()
                      if not name.startswith('__') and callable(value) and hasattr(tk.Frame, name)}
@@ -193,6 +300,7 @@ class DatasetPageTests(unittest.TestCase):
         with patch('jarvis_camera.dataset_page.filedialog.askdirectory') as dialog:
             self.page._export()
             self.page._convert()
+            self.page._direct_export()
             dialog.assert_not_called()
         self.assertFalse(self.page.exporting)
 
@@ -247,6 +355,9 @@ class DatasetPageTests(unittest.TestCase):
         self.page._jobs.append({'kind': 'convert'})
         self.assertTrue(self.page.exporting)
         self.page._jobs.clear()
+        self.page._active = {'kind': 'direct_export'}
+        self.assertTrue(self.page.exporting)
+        self.page._active = None
 
     def test_blocked_preparation_shows_error_before_warning(self):
         self.page._completed({'kind': 'prepare', 'payload': {'episode': self.folder}},

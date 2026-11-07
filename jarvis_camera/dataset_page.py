@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 import queue
 import subprocess
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -135,6 +136,48 @@ def run_conversion(bundle: Path, output: Path, python: Path, progress) -> dict:
     return result
 
 
+def check_conversion_environment(python: Path) -> dict:
+    """Check the selected standalone interpreter without opening a window or network."""
+    worker = Path(__file__).resolve().with_name('lerobot_export_worker.py')
+    if not python.is_file() or not worker.is_file():
+        raise ValueError('转换 Python 或转换组件不存在，请重新配置。')
+    script = r'''
+import importlib.util, json, sys
+try:
+    spec = importlib.util.spec_from_file_location('jarvis_conversion_worker', sys.argv[1])
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+    factory, info = worker._load_dataset_factory()
+    import numpy, PIL, av
+    print(json.dumps({'ok': True, 'revision': info['revision'], 'version': info['version']}))
+except Exception as error:
+    print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
+    sys.exit(1)
+'''
+    try:
+        result = subprocess.run([str(python), '-c', script, str(worker)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, encoding='utf-8', errors='replace',
+                                timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except subprocess.TimeoutExpired as error:
+        raise ValueError('转换环境检查超时，请检查该 Python 是否可用。') from error
+    except OSError as error:
+        raise ValueError('无法启动所选 Python，请检查路径和权限。') from error
+    parsed = None
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and 'ok' in value:
+            parsed = value
+            break
+    if result.returncode or not parsed or parsed.get('ok') is not True:
+        error = str((parsed or {}).get('error') or '缺少 LeRobot 或视频转换依赖。')
+        raise ValueError('转换环境检查未通过：' + error)
+    return parsed
+
+
 def perform_job(kind: str, payload: dict, progress) -> object:
     """Worker-only entry point, separated so orchestration can be tested offline."""
     if kind in ('prepare', 'load', 'approve'):
@@ -149,6 +192,23 @@ def perform_job(kind: str, payload: dict, progress) -> object:
         return export_bundle(payload['episodes'], payload['output'], seed=42, progress=progress)
     if kind == 'convert':
         return run_conversion(payload['bundle'], payload['output'], payload['python'], progress)
+    if kind == 'check_env':
+        return check_conversion_environment(payload['python'])
+    if kind == 'direct_export':
+        from .dataset_export import export_bundle
+        output = Path(payload['output'])
+        if output.exists() or output.is_symlink():
+            raise FileExistsError('输出目录已经存在，未覆盖。')
+        progress({'message': '正在检查转换环境…'})
+        check_conversion_environment(payload['python'])
+        # TemporaryDirectory owns this new, uniquely named staging directory;
+        # the original recordings and any prior exports remain untouched.
+        with tempfile.TemporaryDirectory(prefix='.jarvis-conversion-', dir=output.parent) as folder:
+            bundle = Path(folder) / 'bundle'
+            progress({'message': '正在检查并整理已审核示范…'})
+            export_bundle(payload['episodes'], bundle, seed=42, progress=progress)
+            progress({'message': '正在转换 LeRobot 数据…'})
+            return run_conversion(bundle, output, payload['python'], progress)
     raise ValueError('未知的样本处理任务。')
 
 
@@ -173,6 +233,8 @@ class DatasetPage(tk.Frame):
         self._preview_after = None
         self._current_approved = False
         self._last_bundle = None
+        self._dataset_python = self._saved_dataset_python()
+        self.environment_text = tk.StringVar(value=self._environment_description())
         self.status_text = tk.StringVar(value='录完一条示范后，会自动整理到这里。')
         self.folder_text = tk.StringVar(value='')
         self.details_text = tk.StringVar(value='选择一条样本，查看两路画面及记录结果。')
@@ -187,8 +249,8 @@ class DatasetPage(tk.Frame):
 
     @property
     def exporting(self):
-        return bool((self._active and self._active['kind'] in ('export', 'convert'))
-                    or any(job['kind'] in ('export', 'convert') for job in self._jobs))
+        return bool((self._active and self._active['kind'] in ('export', 'convert', 'direct_export'))
+                    or any(job['kind'] in ('export', 'convert', 'direct_export') for job in self._jobs))
 
     def _recording_busy(self):
         record = getattr(self.app, 'pages', {}).get('record')
@@ -199,6 +261,26 @@ class DatasetPage(tk.Frame):
         folder = getattr(record, 'folder', None)
         value = folder.get().strip() if folder is not None else ''
         return Path(value).expanduser() if value else app_directory() / 'recordings'
+
+    def _saved_dataset_python(self):
+        settings = getattr(self.app, 'settings', None)
+        try:
+            saved = str(settings.get('dataset_python') or '').strip() if settings else ''
+        except KeyError:
+            saved = ''
+        # An explicit choice always wins, even if it is currently unavailable:
+        # the user needs to see that state rather than silently switch Python.
+        if saved:
+            return saved
+        bundled_environment = app_directory().parent / 'JARVIS-LeRobot-Environment' / 'Scripts' / 'python.exe'
+        return str(bundled_environment) if bundled_environment.is_file() else ''
+
+    def _environment_description(self):
+        if not self._dataset_python:
+            return '转换环境：尚未配置（请点“配置转换环境”）'
+        if not Path(self._dataset_python).is_file():
+            return '转换环境：所选 Python 不存在，请重新配置  ' + self._dataset_python
+        return '转换环境：已选择，尚未检查  ' + self._dataset_python
 
     def _label(self, parent, text='', size=10, color=TEXT, **kwargs):
         return tk.Label(parent, text=text, bg=kwargs.pop('bg', BG), fg=color,
@@ -214,19 +296,30 @@ class DatasetPage(tk.Frame):
     def _build(self):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(3, weight=1)
-        self._label(self, '示范样本', 21).grid(row=0, column=0, sticky='w')
+        header = tk.Frame(self, bg=BG)
+        header.grid(row=0, column=0, sticky='ew')
+        self._label(header, '示范样本', 21).pack(side='left')
+        self.check_env_button = self._button(header, '检查环境', self._check_environment)
+        self.check_env_button.pack(side='right', padx=(7, 0))
+        self.configure_env_button = self._button(header, '配置转换环境', self._configure_environment)
+        self.configure_env_button.pack(side='right')
         toolbar = tk.Frame(self, bg=BG)
         toolbar.grid(row=1, column=0, sticky='ew', pady=(10, 6))
         self.refresh_button = self._button(toolbar, '刷新', self.refresh)
         self.prepare_button = self._button(toolbar, '整理所选', self._prepare_selected)
         self.view_button = self._button(toolbar, '查看与检查', self._load_selected)
-        self.export_button = self._button(toolbar, '导出已检查样本', self._export, True)
+        self.direct_export_button = self._button(toolbar, '直接导出 LeRobot', self._direct_export, True)
+        self.export_button = self._button(toolbar, '导出已检查样本', self._export)
         self.convert_button = self._button(toolbar, '转为 LeRobot…', self._convert)
         for widget in (self.refresh_button, self.prepare_button, self.view_button,
-                       self.export_button, self.convert_button):
+                       self.direct_export_button, self.export_button, self.convert_button):
             widget.pack(side='left', padx=(0, 7))
-        self._label(self, textvariable=self.folder_text, size=9, color=MUTED,
-                    anchor='w').grid(row=2, column=0, sticky='ew', pady=(0, 6))
+        folders = tk.Frame(self, bg=BG)
+        folders.grid(row=2, column=0, sticky='ew', pady=(0, 6))
+        self._label(folders, textvariable=self.folder_text, size=9, color=MUTED,
+                    anchor='w').pack(fill='x')
+        self._label(folders, textvariable=self.environment_text, size=9, color=MUTED,
+                    anchor='w').pack(fill='x')
 
         body = tk.PanedWindow(self, orient='horizontal', bg=BG, bd=0,
                               sashwidth=7, sashrelief='flat')
@@ -377,6 +470,9 @@ class DatasetPage(tk.Frame):
         self.view_button.configure(state='normal' if idle and selected else 'disabled')
         self.export_button.configure(state='normal' if idle and not recording else 'disabled')
         self.convert_button.configure(state='normal' if idle and not recording else 'disabled')
+        self.direct_export_button.configure(state='normal' if idle and not recording else 'disabled')
+        self.configure_env_button.configure(state='normal' if idle and not recording else 'disabled')
+        self.check_env_button.configure(state='normal' if idle and not recording else 'disabled')
         view_ready = bool(idle and self._rows and self._view_episode == selected)
         for widget in self.review_checks:
             widget.configure(state='normal' if view_ready else 'disabled')
@@ -413,7 +509,9 @@ class DatasetPage(tk.Frame):
         self._active = job
         verbs = {'prepare': '正在整理示范…', 'load': '正在检查并读取样本…',
                  'approve': '正在保存检查结果…', 'export': '正在导出已检查样本…',
-                 'convert': '正在转换 LeRobot 数据…'}
+                 'convert': '正在转换 LeRobot 数据…',
+                 'direct_export': '正在直接导出 LeRobot 数据…',
+                 'check_env': '正在检查转换环境…'}
         self.status_text.set(verbs[job['kind']])
         self._thread = threading.Thread(target=self._work, args=(job,),
                                         name='dataset-' + job['kind'], daemon=True)
@@ -447,6 +545,8 @@ class DatasetPage(tk.Frame):
             self._thread = None
             if event == 'error':
                 self.status_text.set('处理未完成：' + str(value))
+                if job['kind'] == 'check_env':
+                    self.environment_text.set('转换环境：检查未通过  ' + self._dataset_python)
             else:
                 self._completed(job, value)
             self._dirty = True
@@ -494,8 +594,12 @@ class DatasetPage(tk.Frame):
             self._last_bundle = Path(result.get('output_dir') or job['payload']['output'])
             counts = result.get('counts') or {}
             self.status_text.set(f"已导出样本包：训练 {counts.get('train', 0)} 条、验证 {counts.get('val', 0)} 条、测试 {counts.get('test', 0)} 条。位置：{self._last_bundle}")
-        elif kind == 'convert':
+        elif kind in ('convert', 'direct_export'):
             self.status_text.set('LeRobot 数据已生成：' + str(result.get('output_dir') or job['payload']['output']))
+        elif kind == 'check_env':
+            if str(job['payload']['python']) == self._dataset_python:
+                self.environment_text.set('转换环境：依赖检查通过（实际转换仍需验证）  ' + self._dataset_python)
+            self.status_text.set('转换环境检查通过：LeRobot 固定版本与基础依赖可导入。')
 
     def _prepare_selected(self):
         selected = self._selected()
@@ -516,6 +620,58 @@ class DatasetPage(tk.Frame):
             self.status_text.set('请实际检查后逐项确认，不能自动勾选。')
             return
         self._enqueue('approve', {'episode': self._view_episode, 'checks': checks})
+
+    def _configure_environment(self):
+        if self.busy or self._recording_busy() or self._closing:
+            return
+        python = filedialog.askopenfilename(
+            title='选择已安装 LeRobot 的转换 Python',
+            initialdir=str(Path(self._dataset_python).parent) if self._dataset_python else None,
+            filetypes=[('Python', 'python.exe'), ('所有文件', '*')], parent=self.app)
+        if not python:
+            return
+        if not Path(python).is_file():
+            messagebox.showerror('Python 不可用', '所选文件不存在。', parent=self.app)
+            return
+        self._dataset_python = str(Path(python))
+        settings = getattr(self.app, 'settings', None)
+        if settings:
+            try:
+                settings.save(dataset_python=self._dataset_python)
+            except OSError:
+                self.status_text.set('无法保存环境路径，本次仍可使用。')
+        self.environment_text.set(self._environment_description())
+        self._check_environment()
+
+    def _check_environment(self):
+        if self.busy or self._recording_busy() or self._closing:
+            return
+        if not self._dataset_python or not Path(self._dataset_python).is_file():
+            self.environment_text.set(self._environment_description())
+            messagebox.showinfo('先配置转换环境', '请选择已经安装 LeRobot 的转换 Python。', parent=self.app)
+            return
+        self.environment_text.set('转换环境：正在检查…  ' + self._dataset_python)
+        self._enqueue('check_env', {'python': Path(self._dataset_python)})
+
+    def _direct_export(self):
+        if self.busy or self._recording_busy() or self._closing:
+            self.status_text.set('请先结束录制并等待当前处理完成，再导出。')
+            return
+        if not self._dataset_python or not Path(self._dataset_python).is_file():
+            messagebox.showinfo('先配置转换环境', '请先点击“配置转换环境”，选择已安装 LeRobot 的 Python。', parent=self.app)
+            return
+        self.refresh()
+        candidates = [entry['path'] for entry in self.entries if entry['reviewed']]
+        if len(candidates) < 3:
+            messagebox.showinfo('先检查更多样本', '至少需要 3 条已检查的成功示范，才能分别保留训练、验证和测试数据。', parent=self.app)
+            return
+        folder = filedialog.askdirectory(title='选择 LeRobot 数据保存位置',
+                                          initialdir=str(self._recording_root().parent), parent=self.app)
+        if not folder:
+            return
+        output = Path(folder) / f'lerobot_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}'
+        self._enqueue('direct_export', {'episodes': candidates, 'output': output,
+                                        'python': Path(self._dataset_python)})
 
     def _export(self):
         if self.busy or self._recording_busy() or self._closing:
@@ -564,6 +720,8 @@ class DatasetPage(tk.Frame):
                 settings.save(dataset_python=python)
             except OSError:
                 self.status_text.set('无法记住 Python 路径，本次转换仍可继续。')
+        self._dataset_python = str(Path(python))
+        self.environment_text.set(self._environment_description())
         output = Path(folder) / f'lerobot_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}'
         self._enqueue('convert', {'bundle': Path(bundle), 'output': output, 'python': Path(python)})
 
