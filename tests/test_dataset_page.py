@@ -14,7 +14,9 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 
-from jarvis_camera.dataset_page import DatasetPage, scan_episodes, safe_image_path, run_conversion, perform_job
+from jarvis_camera.dataset_page import (DatasetPage, scan_episodes, safe_image_path,
+                                        run_conversion, run_incremental_conversion,
+                                        is_incremental_candidate, find_latest_incremental, perform_job)
 
 
 def write_json(path, value):
@@ -38,6 +40,240 @@ def make_episode(root, name='episode_1', reviewed=False):
 
 
 class LibraryFileTests(unittest.TestCase):
+    def test_only_complete_incremental_manifests_are_discovery_candidates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            old = root / 'lerobot_old'
+            old.mkdir()
+            write_json(old / 'export.json', {'complete': True, 'format': 'lerobot'})
+            bad = root / 'lerobot_incomplete'
+            bad.mkdir()
+            write_json(bad / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': False, 'episodes': [], 'files_sha256': {}})
+            with self.assertRaisesRegex(ValueError, '最新转换记录不完整或无效'):
+                find_latest_incremental(root)
+            (bad / 'jarvis_incremental_manifest.json').unlink()
+            self.assertIsNone(find_latest_incremental(root))
+            valid = root / 'lerobot_valid'
+            valid.mkdir()
+            write_json(valid / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': True, 'episodes': [], 'files_sha256': {}})
+            self.assertEqual(find_latest_incremental(root), valid)
+            self.assertTrue((old / 'export.json').is_file())
+
+    def test_latest_invalid_manifest_never_falls_back_or_starts_reconversion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            valid, bad = root / 'lerobot_valid', root / 'lerobot_bad'
+            valid.mkdir()
+            bad.mkdir()
+            valid_path = valid / 'jarvis_incremental_manifest.json'
+            bad_path = bad / 'jarvis_incremental_manifest.json'
+            write_json(valid_path, {'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                                    'complete': True, 'episodes': [], 'files_sha256': {}})
+            bad_path.write_text('{invalid json', encoding='utf-8')
+            os.utime(valid_path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(bad_path, ns=(2_000_000_000, 2_000_000_000))
+            with self.assertRaisesRegex(ValueError, '未重新转换'):
+                find_latest_incremental(root)
+            payload = {'episodes': [], 'output': root / 'lerobot_new', 'python': root / 'python.exe'}
+            with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
+                 patch('jarvis_camera.dataset_export.export_bundle') as export, \
+                 patch('jarvis_camera.dataset_page.run_incremental_conversion') as convert:
+                with self.assertRaisesRegex(ValueError, '未重新转换'):
+                    perform_job('direct_export', payload, lambda _info: None)
+            export.assert_not_called()
+            convert.assert_not_called()
+            self.assertTrue(valid_path.is_file())
+            self.assertEqual(bad_path.read_text(encoding='utf-8'), '{invalid json')
+
+    def test_rejects_junction_candidates_instead_of_following_or_falling_back(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            junction = root / 'lerobot_junction'
+            junction.mkdir()
+            write_json(junction / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': True, 'episodes': [], 'files_sha256': {}})
+            with patch('jarvis_camera.dataset_page.Path.is_junction',
+                       autospec=True, side_effect=lambda value: value.name == junction.name):
+                self.assertFalse(is_incremental_candidate(junction))
+                with self.assertRaisesRegex(ValueError, '链接形式的转换目录'):
+                    find_latest_incremental(root)
+
+    def test_incremental_protocol_forwards_prior_and_reports_result(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.StringIO('\n'.join([
+                    json.dumps({'type': 'progress', 'message': '复用中'}),
+                    json.dumps({'type': 'result', 'output_dir': 'actual-returned-output'})]))
+            def wait(self): return 0
+            def poll(self): return 0
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            python = root / 'python.exe'
+            python.write_bytes(b'placeholder')
+            prior = root / 'prior'
+            events = []
+            with patch('jarvis_camera.dataset_page.Path.is_file', return_value=True), \
+                 patch('jarvis_camera.dataset_page.subprocess.Popen', return_value=Process()) as popen:
+                result = run_incremental_conversion(root / 'bundle', root / 'output', python,
+                                                    events.append, prior=prior)
+            self.assertEqual(result['output_dir'], 'actual-returned-output')
+            self.assertEqual(events[0]['message'], '复用中')
+            args = popen.call_args.args[0]
+            self.assertTrue(args[1].endswith('incremental_export.py'))
+            self.assertEqual(args[-2:], ['--prior', str(prior)])
+
+    def test_direct_export_prefers_remembered_prior_across_output_folders(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            prior = root / 'different-parent' / 'lerobot_prior'
+            prior.mkdir(parents=True)
+            write_json(prior / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': True, 'episodes': [], 'files_sha256': {}})
+            output_parent = root / 'new-parent'
+            output_parent.mkdir()
+            fallback = output_parent / 'lerobot_fallback'
+            fallback.mkdir()
+            write_json(fallback / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': True, 'episodes': [], 'files_sha256': {}})
+            output = output_parent / 'lerobot_new'
+            payload = {'episodes': [root / 'raw'], 'output': output,
+                       'python': root / 'python.exe', 'prior_path': str(prior)}
+            events = []
+            def export(_episodes, bundle, *, seed, progress):
+                bundle.mkdir()
+            def convert(_bundle, _out, _python, _progress, *, prior):
+                self.assertEqual(prior, root / 'different-parent' / 'lerobot_prior')
+                return {'output_dir': str(prior)}
+            with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
+                 patch('jarvis_camera.dataset_export.export_bundle', side_effect=export), \
+                 patch('jarvis_camera.dataset_page.run_incremental_conversion', side_effect=convert):
+                result = perform_job('direct_export', payload, events.append)
+            self.assertEqual(result['output_dir'], str(prior))
+            self.assertTrue(any(str(prior) in item['message'] for item in events))
+            self.assertTrue((prior / 'jarvis_incremental_manifest.json').is_file())
+            self.assertTrue((fallback / 'jarvis_incremental_manifest.json').is_file())
+
+    def test_direct_export_refuses_unavailable_prior_without_reencoding(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            output = root / 'lerobot_new'
+            payload = {'episodes': [], 'output': output, 'python': root / 'python.exe',
+                       'prior_path': str(root / 'unavailable')}
+            events = []
+            with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
+                 patch('jarvis_camera.dataset_page.find_latest_incremental') as discover, \
+                 patch('jarvis_camera.dataset_export.export_bundle') as export, \
+                 patch('jarvis_camera.dataset_page.run_incremental_conversion',
+                       return_value={'output_dir': str(output)}) as convert:
+                with self.assertRaisesRegex(ValueError, '上次转换记录不可用，未重新转换'):
+                    perform_job('direct_export', payload, events.append)
+            discover.assert_not_called()
+            export.assert_not_called()
+            convert.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_direct_export_remembers_actual_worker_output_not_proposed_path(self):
+        settings = Mock()
+        checkbox = Mock()
+        page = SimpleNamespace(status_text=Mock(), app=SimpleNamespace(settings=settings), rebuild_export=checkbox)
+        DatasetPage._completed(page, {'kind': 'direct_export', 'payload': {'output': Path('new')}},
+                               {'output_dir': 'previous-verified-output', 'incremental': {'reused': 3, 'converted': 0}})
+        settings.save.assert_called_once_with(dataset_last_export='previous-verified-output')
+        checkbox.set.assert_called_once_with(False)
+        self.assertIn('已复用 3 条，新转换 0 条', page.status_text.set.call_args.args[0])
+        self.assertIn('previous-verified-output', page.status_text.set.call_args.args[0])
+
+    def test_direct_export_explains_persistence_failure(self):
+        settings = Mock()
+        settings.save.side_effect = OSError('read-only')
+        page = SimpleNamespace(status_text=Mock(), app=SimpleNamespace(settings=settings))
+        DatasetPage._completed(page, {'kind': 'direct_export', 'payload': {'output': Path('new')}},
+                               {'output_dir': 'the-result'})
+        message = page.status_text.set.call_args.args[0]
+        self.assertIn('下次自动复用无法保证', message)
+        self.assertIn('请修复写入权限', message)
+        self.assertIn('the-result', message)
+        self.assertEqual(page._dataset_prior, 'the-result')
+
+    def test_choose_existing_incremental_dataset_saves_path_for_verified_reuse(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            prior = root / 'lerobot_prior'
+            prior.mkdir()
+            write_json(prior / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': True, 'episodes': [], 'files_sha256': {}})
+            settings = Mock()
+            page = SimpleNamespace(busy=False, _closing=False, _recording_busy=lambda: False,
+                                   _recording_root=lambda: root / 'recordings',
+                                   app=SimpleNamespace(settings=settings), _dataset_prior='',
+                                   prior_text=Mock(), status_text=Mock())
+            page._prior_description = lambda: DatasetPage._prior_description(page)
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value=str(prior)):
+                DatasetPage._choose_prior(page)
+            settings.save.assert_called_once_with(dataset_last_export=str(prior))
+            self.assertEqual(page._dataset_prior, str(prior))
+            self.assertIn('核验', page.status_text.set.call_args.args[0])
+            settings.save.reset_mock()
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value=str(root)), \
+                 patch('jarvis_camera.dataset_page.messagebox.showerror') as error:
+                DatasetPage._choose_prior(page)
+            error.assert_called_once()
+            settings.save.assert_not_called()
+            self.assertEqual(page._dataset_prior, str(prior))
+
+    def test_choose_existing_incremental_dataset_reports_settings_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            prior = root / 'lerobot_prior'
+            prior.mkdir()
+            write_json(prior / 'jarvis_incremental_manifest.json', {
+                'schema_version': 1, 'format': 'jarvis_incremental_lerobot_v1',
+                'complete': True, 'episodes': [], 'files_sha256': {}})
+            settings = Mock()
+            settings.save.side_effect = OSError('read-only')
+            page = SimpleNamespace(busy=False, _closing=False, _recording_busy=lambda: False,
+                                   _recording_root=lambda: root / 'recordings',
+                                   app=SimpleNamespace(settings=settings), _dataset_prior='',
+                                   prior_text=Mock(), status_text=Mock())
+            page._prior_description = lambda: DatasetPage._prior_description(page)
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value=str(prior)):
+                DatasetPage._choose_prior(page)
+            self.assertEqual(page._dataset_prior, str(prior))
+            self.assertIn('下次自动复用无法保证', page.status_text.set.call_args.args[0])
+
+    def test_explicit_rebuild_skips_all_prior_searches_and_preserves_old(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            prior = root / 'lerobot_prior'
+            prior.mkdir()
+            marker = prior / 'keep.txt'
+            marker.write_text('existing-data', encoding='utf-8')
+            payload = {'episodes': [], 'output': root / 'lerobot_new',
+                       'python': root / 'python.exe', 'prior_path': str(prior), 'rebuild': True}
+            events = []
+            def export(_episodes, bundle, *, seed, progress): bundle.mkdir()
+            with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
+                 patch('jarvis_camera.dataset_page.find_latest_incremental') as discover, \
+                 patch('jarvis_camera.dataset_page.is_incremental_candidate') as check, \
+                 patch('jarvis_camera.dataset_export.export_bundle', side_effect=export), \
+                 patch('jarvis_camera.dataset_page.run_incremental_conversion',
+                       return_value={'output_dir': str(payload['output'])}) as convert:
+                perform_job('direct_export', payload, events.append)
+            discover.assert_not_called()
+            check.assert_not_called()
+            self.assertIsNone(convert.call_args.kwargs['prior'])
+            self.assertTrue(any('重新建立' in e['message'] for e in events))
+            self.assertEqual(marker.read_text(encoding='utf-8'), 'existing-data')
+
     def test_conversion_python_detects_sibling_environment_without_overriding_choice(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -64,6 +300,8 @@ class LibraryFileTests(unittest.TestCase):
             page = SimpleNamespace(
                 busy=False, _closing=False, _recording_busy=lambda: False,
                 _dataset_python=str(python), app=object(), status_text=Mock(),
+                _dataset_prior='',
+                rebuild_export=SimpleNamespace(get=lambda: False),
                 refresh=Mock(), entries=[{'path': p, 'reviewed': True} for p in episodes] +
                                          [{'path': root / 'unreviewed', 'reviewed': False}],
                 _recording_root=lambda: root / 'recordings', _enqueue=Mock())
@@ -74,8 +312,13 @@ class LibraryFileTests(unittest.TestCase):
             self.assertEqual(kind, 'direct_export')
             self.assertEqual(payload['episodes'], episodes)
             self.assertEqual(payload['python'], python)
+            self.assertFalse(payload['rebuild'])
             self.assertFalse(payload['output'].exists())
             self.assertTrue(payload['output'].name.startswith('lerobot_'))
+            page.rebuild_export.get = lambda: True
+            with patch('jarvis_camera.dataset_page.filedialog.askdirectory', return_value=str(root)):
+                DatasetPage._direct_export(page)
+            self.assertTrue(page._enqueue.call_args.args[1]['rebuild'])
 
     def test_one_click_blocks_during_recording_and_for_unreviewed_samples(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -113,15 +356,16 @@ class LibraryFileTests(unittest.TestCase):
                 bundle.mkdir()
                 (bundle / 'bundle.json').write_text('{}', encoding='utf-8')
                 seen.append(bundle)
-            def convert(bundle, out, selected_python, progress):
+            def convert(bundle, out, selected_python, progress, *, prior):
                 self.assertTrue((bundle / 'bundle.json').is_file())
                 self.assertEqual(selected_python, python)
                 self.assertEqual(out, output)
+                self.assertIsNone(prior)
                 out.mkdir()
                 return {'output_dir': str(out)}
             with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
                  patch('jarvis_camera.dataset_export.export_bundle', side_effect=export), \
-                 patch('jarvis_camera.dataset_page.run_conversion', side_effect=convert):
+                 patch('jarvis_camera.dataset_page.run_incremental_conversion', side_effect=convert):
                 self.assertEqual(perform_job('direct_export', payload, lambda _event: None)['output_dir'], str(output))
             self.assertFalse(seen[0].parent.exists())
             self.assertEqual((source / 'keep.txt').read_text(encoding='utf-8'), 'original')
@@ -129,7 +373,7 @@ class LibraryFileTests(unittest.TestCase):
             payload['output'] = root / 'failed-output'
             with patch('jarvis_camera.dataset_page.check_conversion_environment'), \
                  patch('jarvis_camera.dataset_export.export_bundle', side_effect=export), \
-                 patch('jarvis_camera.dataset_page.run_conversion', side_effect=ValueError('failure')):
+                 patch('jarvis_camera.dataset_page.run_incremental_conversion', side_effect=ValueError('failure')):
                 with self.assertRaisesRegex(ValueError, 'failure'):
                     perform_job('direct_export', payload, lambda _event: None)
             self.assertFalse(seen[1].parent.exists())

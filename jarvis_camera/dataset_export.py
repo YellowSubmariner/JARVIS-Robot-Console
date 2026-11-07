@@ -33,10 +33,11 @@ POSITION_CONTRACT = {
 }
 
 
-def load_prepared_episode(episode_dir, *, require_review=True):
+def load_prepared_episode(episode_dir, *, require_review=True, include_source_hashes=False):
     """Lazy import keeps the export module independent of Tk and robot SDKs."""
     from .preparation import load_prepared_episode as load
-    return load(episode_dir, require_review=require_review)
+    return load(episode_dir, require_review=require_review,
+                include_source_hashes=include_source_hashes)
 
 
 def _safe_file(root: Path, relative: str) -> Path:
@@ -128,11 +129,22 @@ def export_bundle(episode_dirs, output_dir, *, seed=42,
     if any(output.resolve().is_relative_to(ep) or ep.is_relative_to(output.resolve()) for ep in directories):
         raise ValueError('导出目录必须与原始示范目录分开。')
 
+    # Keep each episode's verified snapshot on disk rather than in RAM. This
+    # avoids re-reading every original image between validation and copying,
+    # while retaining bounded memory even for hundreds of demonstrations.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.jarvis-verified-', dir=output.parent) as spool:
+        return _export_scanned(directories, output, seed, progress, Path(spool))
+
+
+def _export_scanned(directories, output, seed, progress, spool):
+
     items = []
     canonical = None
     fingerprints = set()
     for index, episode in enumerate(directories, 1):
-        manifest, rows = load_prepared_episode(episode, require_review=True)
+        manifest, rows, source_hashes = load_prepared_episode(
+            episode, require_review=True, include_source_hashes=True)
         if not manifest.get('technical_pass') or manifest.get('status') != 'ready_for_review':
             raise ValueError('存在未通过数据检查的示范，未导出。')
         contract = _contract(manifest)
@@ -151,10 +163,16 @@ def export_bundle(episode_dirs, output_dir, *, seed=42,
         task = manifest.get('task')
         if not isinstance(task, str) or not task.strip():
             raise ValueError('示范缺少任务说明。')
-        # Keep only manifests across episodes. The preparation API returns one
-        # episode's rows at a time; retaining every episode here would make a
-        # larger collection consume unnecessary laptop memory.
-        items.append({'source': episode, 'manifest': manifest})
+        # Persist a digest-protected snapshot rather than keeping every
+        # episode's arrays and source hashes in memory until copy time.
+        snapshot = spool / f'{index:08d}.json'
+        snapshot_data = json.dumps({'rows': rows, 'source_hashes': source_hashes},
+                                   ensure_ascii=False, allow_nan=False,
+                                   separators=(',', ':')).encode('utf-8')
+        with snapshot.open('xb') as stream:
+            stream.write(snapshot_data)
+        items.append({'source': episode, 'manifest': manifest, 'snapshot': snapshot,
+                      'snapshot_sha256': hashlib.sha256(snapshot_data).hexdigest()})
         _notify(progress, stage='validate', completed=index, total=len(directories),
                 message=f'已检查 {index}/{len(directories)} 条示范')
 
@@ -185,9 +203,11 @@ def export_bundle(episode_dirs, output_dir, *, seed=42,
             destination.mkdir(parents=True)
             source = item['source']
             manifest = item['manifest']
-            current, rows = load_prepared_episode(source, require_review=True)
-            if current['source_fingerprint'] != manifest['source_fingerprint'] or current.get('prepared_signature') != manifest.get('prepared_signature'):
-                raise ValueError('导出期间示范发生变化，已取消；请重新检查后导出。')
+            snapshot_data = item['snapshot'].read_bytes()
+            if hashlib.sha256(snapshot_data).hexdigest() != item['snapshot_sha256']:
+                raise ValueError('导出期间临时整理数据发生变化，已取消。')
+            snapshot = json.loads(snapshot_data)
+            rows, source_hashes = snapshot['rows'], snapshot['source_hashes']
             file_map = {}
             hashes = {}
             with (destination / 'samples.jsonl').open('x', encoding='utf-8', newline='\n') as stream:
@@ -205,7 +225,11 @@ def export_bundle(episode_dirs, output_dir, *, seed=42,
                         if image_identity not in file_map:
                             camera = key.rsplit('.', 1)[-1]
                             local = f'images/{camera}/{len(file_map):08d}.jpg'
-                            hashes[local] = _copy_hashed(source_file, destination / local)
+                            copied_hash = _copy_hashed(source_file, destination / local)
+                            original_key = source_file.relative_to(source).as_posix()
+                            if copied_hash != source_hashes.get(original_key):
+                                raise ValueError('导出期间原始图片发生变化，已取消；请重新检查后导出。')
+                            hashes[local] = copied_hash
                             # Validate one decoded image at a time, never keeping
                             # an episode's images in memory. Pillow is already a
                             # desktop dependency; LeRobot and torch are not.

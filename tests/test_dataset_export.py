@@ -88,9 +88,15 @@ class DatasetExportTests(unittest.TestCase):
         self.prepared[root.resolve()] = (manifest, rows)
         return root
 
-    def load(self, episode, *, require_review):
+    def load(self, episode, *, require_review, include_source_hashes=False):
         self.assertTrue(require_review)
-        return copy.deepcopy(self.prepared[Path(episode).resolve()])
+        root = Path(episode).resolve()
+        manifest, rows = copy.deepcopy(self.prepared[root])
+        if include_source_hashes:
+            hashes = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in root.glob('*_frames/*.jpg')}
+            return manifest, rows, hashes
+        return manifest, rows
 
     def export(self, name='bundle'):
         return export_bundle(self.episodes, self.root / name)
@@ -196,17 +202,53 @@ class DatasetExportTests(unittest.TestCase):
 
     def test_source_changes_during_export_abort_instead_of_certifying_old_review(self):
         calls = {}
-        def changing(episode, *, require_review):
+        def changing(episode, *, require_review, include_source_hashes=False):
             key = Path(episode).resolve()
             calls[key] = calls.get(key, 0) + 1
-            manifest, rows = self.load(episode, require_review=require_review)
+            result = self.load(episode, require_review=require_review,
+                               include_source_hashes=include_source_hashes)
+            manifest = result[0]
             if calls[key] > 1:
                 manifest['source_fingerprint'] = 'changed'
-            return manifest, rows
+            return result
         with patch('jarvis_camera.dataset_export.load_prepared_episode', side_effect=changing):
             with self.assertRaisesRegex(ValueError, '发生变化'):
                 self.export('changed')
         self.assertFalse((self.root / 'changed').exists())
+
+    def test_copied_image_matches_reviewed_snapshot_even_if_source_is_restored(self):
+        from jarvis_camera.dataset_export import _copy_hashed
+
+        changed = False
+        def transient_change(source, destination):
+            nonlocal changed
+            if changed:
+                return _copy_hashed(source, destination)
+            changed = True
+            original = source.read_bytes()
+            try:
+                source.write_bytes(b'temporarily changed while copying')
+                return _copy_hashed(source, destination)
+            finally:
+                source.write_bytes(original)
+        with patch('jarvis_camera.dataset_export._copy_hashed', side_effect=transient_change):
+            with self.assertRaisesRegex(ValueError, '原始图片发生变化'):
+                self.export('transient')
+        self.assertTrue(changed)
+        self.assertFalse((self.root / 'transient').exists())
+        self.assertEqual(list(self.root.glob('.transient.preparing-*')), [])
+        self.assertEqual(list(self.root.glob('.jarvis-verified-*')), [])
+
+    def test_verified_export_reads_each_original_snapshot_twice(self):
+        calls = {}
+        def counted(episode, *, require_review, include_source_hashes=False):
+            key = Path(episode).resolve()
+            calls[key] = calls.get(key, 0) + 1
+            return self.load(episode, require_review=require_review,
+                             include_source_hashes=include_source_hashes)
+        with patch('jarvis_camera.dataset_export.load_prepared_episode', side_effect=counted):
+            self.export('twice')
+        self.assertEqual(set(calls.values()), {2})
 
     def test_worker_uses_rgb_float32_and_separate_dataset_writers(self):
         bundle = self.export()

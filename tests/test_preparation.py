@@ -281,6 +281,18 @@ class PreparationTests(unittest.TestCase):
         self.assertFalse(manifest['training_ready'])
         self.assertFalse(read_json(self.root / 'metadata.json')['training_ready'])
 
+    def test_export_can_use_the_exact_reviewed_source_hashes(self):
+        import hashlib
+        prepare_episode(self.root)
+        approve_episode(self.root, CHECKS)
+        ordinary = load_prepared_episode(self.root, require_review=True)
+        extended = load_prepared_episode(self.root, require_review=True, include_source_hashes=True)
+        self.assertEqual(len(ordinary), 2)
+        self.assertEqual(ordinary, extended[:2])
+        image = self.root / 'top_frames/frame_00000010.jpg'
+        self.assertEqual(extended[2]['top_frames/frame_00000010.jpg'],
+                         hashlib.sha256(image.read_bytes()).hexdigest())
+
     def test_raw_image_edit_invalidates_existing_review(self):
         prepare_episode(self.root)
         approve_episode(self.root, CHECKS)

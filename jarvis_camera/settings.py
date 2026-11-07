@@ -18,6 +18,8 @@ DEFAULTS = {
     'kortex_python': '',
     'recordings_dir': '',
     'dataset_python': '',
+    # Last verified incremental output, reused even when choosing another parent.
+    'dataset_last_export': '',
 }
 
 

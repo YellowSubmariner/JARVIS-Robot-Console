@@ -135,7 +135,7 @@ def _stamp(path: Path):
     return stat.st_size, stat.st_mtime_ns
 
 
-def _snapshot(root: Path):
+def _snapshot(root: Path, *, include_hashes=False):
     """Read source metadata and hash images incrementally, without decoding them."""
     documents, hashes, stamps = {}, {}, {}
     for name in RAW_FILES + OPTIONAL_FILES:
@@ -174,6 +174,8 @@ def _snapshot(root: Path):
             hashes[normalized] = digest.hexdigest()
             stamps[normalized] = before
     fingerprint = hashlib.sha256(_json_bytes(hashes)).hexdigest()
+    if include_hashes:
+        return documents, fingerprint, stamps, hashes
     return documents, fingerprint, stamps
 
 
@@ -445,8 +447,12 @@ def prepare_episode(episode_dir, config=None) -> dict:
     return manifest
 
 
-def load_prepared_episode(episode_dir, require_review=False) -> tuple[dict, list]:
-    """Read a valid unchanged generation; optionally require explicit review."""
+def load_prepared_episode(episode_dir, require_review=False, *, include_source_hashes=False):
+    """Read a valid unchanged generation; optionally include source-file SHA256s.
+
+    The default two-value return remains unchanged. Source hashes allow an
+    exporter to verify a copied image against the exact reviewed snapshot.
+    """
     root = _root(episode_dir)
     try:
         manifest = _parse(_within(root, 'prepared/manifest.json').read_bytes(), 'manifest.json')
@@ -459,7 +465,8 @@ def load_prepared_episode(episode_dir, require_review=False) -> tuple[dict, list
             raise PreparationError('本次示范未通过整理检查。' + (' ' + messages[0] if messages else ''))
         if manifest.get('schema_version') != 1 or manifest.get('action_schema') != ACTION_SCHEMA:
             raise PreparationError('整理格式版本不受支持，请重新整理。')
-        source, fingerprint, stamps = _snapshot(root)
+        snapshot = _snapshot(root, include_hashes=include_source_hashes)
+        source, fingerprint, stamps = snapshot[:3]
         if any(_stamp(_within(root, name)) != before for name, before in stamps.items()):
             raise PreparationError('原始数据正在变化，请结束录制后重新整理。')
         if fingerprint != manifest.get('source_fingerprint'):
@@ -479,6 +486,8 @@ def load_prepared_episode(episode_dir, require_review=False) -> tuple[dict, list
                     or not isinstance(checks, dict)
                     or any(checks.get(key) is not True for key in REVIEW_CHECKS)):
                 raise PreparationError('检查记录不完整或已经过期，请重新回放确认。')
+        if include_source_hashes:
+            return manifest, samples, snapshot[3]
         return manifest, samples
     except PreparationError:
         raise

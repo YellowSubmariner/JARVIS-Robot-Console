@@ -34,6 +34,7 @@ CYAN = '#5ddac6'
 AMBER = '#f4c779'
 MAX_QUEUED_JOBS = 32
 REVIEW_KEYS = ('alignment', 'position_targets', 'stable_end')
+INCREMENTAL_MANIFEST = 'jarvis_incremental_manifest.json'
 
 
 def read_json_object(path: Path) -> dict:
@@ -97,15 +98,14 @@ def safe_image_path(episode: Path, relative: str) -> Path:
     return resolved
 
 
-def run_conversion(bundle: Path, output: Path, python: Path, progress) -> dict:
-    """Use an explicitly selected, already prepared interpreter; never install packages."""
-    worker = Path(__file__).resolve().with_name('lerobot_export_worker.py')
+def _run_conversion_worker(worker: Path, arguments: list[str], python: Path, progress) -> dict:
+    """Run the worker's JSON progress protocol without opening a window."""
     if not python.is_file() or not worker.is_file():
         raise ValueError('转换程序或所选 Python 不存在。')
     result = None
     reported_error = None
     process = subprocess.Popen(
-        [str(python), str(worker), '--bundle', str(bundle), '--output', str(output)],
+        [str(python), str(worker), *arguments],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding='utf-8', errors='replace',
         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
@@ -134,6 +134,72 @@ def run_conversion(bundle: Path, output: Path, python: Path, progress) -> dict:
     if code != 0 or result is None or reported_error:
         raise ValueError(reported_error or '转换未完成。请确认所选环境已经安装兼容的 LeRobot 和视频依赖。')
     return result
+
+
+def run_conversion(bundle: Path, output: Path, python: Path, progress) -> dict:
+    """Convert an existing ordinary bundle with the legacy conversion worker."""
+    worker = Path(__file__).resolve().with_name('lerobot_export_worker.py')
+    return _run_conversion_worker(worker, ['--bundle', str(bundle), '--output', str(output)], python, progress)
+
+
+def run_incremental_conversion(bundle: Path, output: Path, python: Path, progress,
+                               prior: Path | None = None) -> dict:
+    """Create a new dataset, optionally reusing a verified earlier generation."""
+    worker = Path(__file__).resolve().with_name('incremental_export.py')
+    arguments = ['--bundle', str(bundle), '--output', str(output)]
+    if prior is not None:
+        arguments.extend(('--prior', str(prior)))
+    return _run_conversion_worker(worker, arguments, python, progress)
+
+
+def is_incremental_candidate(path: Path) -> bool:
+    """Quick structural check, never a substitute for worker integrity checks."""
+    if path.is_symlink() or path.is_junction() or not path.is_dir():
+        return False
+    manifest_path = path / INCREMENTAL_MANIFEST
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return False
+    manifest = read_json_object(manifest_path)
+    return (type(manifest.get('schema_version')) is int and manifest['schema_version'] == 1
+            and manifest.get('format') == 'jarvis_incremental_lerobot_v1'
+            and manifest.get('complete') is True
+            and isinstance(manifest.get('episodes'), list)
+            and isinstance(manifest.get('files_sha256'), dict))
+
+
+def find_latest_incremental(parent: Path) -> Path | None:
+    """Find a candidate manifest; the worker must verify it before any reuse.
+
+    Old exports contain no per-episode provenance and cannot be auto-reused.
+    A newer invalid or incomplete manifest must not silently fall back to an
+    older generation or cause a full re-encode. The worker revalidates all data.
+    """
+    if not parent.is_dir():
+        return None
+    candidates = []
+    for path in parent.iterdir():
+        if not path.name.startswith('lerobot_'):
+            continue
+        if path.is_symlink() or path.is_junction():
+            raise ValueError('发现链接形式的转换目录，不能安全选择历史记录；请检查目录或勾选“重新建立（全部转换）”。')
+        if not path.is_dir():
+            continue
+        manifest_path = path / INCREMENTAL_MANIFEST
+        try:
+            # lstat includes broken links or unexpected directories as invalid
+            # candidates instead of silently falling back to an older export.
+            stat = manifest_path.lstat()
+        except FileNotFoundError:
+            continue  # legacy export: no provenance manifest at all
+        except OSError as error:
+            raise ValueError('无法读取转换记录，请检查目录权限或勾选“重新建立（全部转换）”。') from error
+        candidates.append((stat.st_mtime_ns, path.name, path))
+    if not candidates:
+        return None
+    latest = max(candidates)[2]
+    if not is_incremental_candidate(latest):
+        raise ValueError('最新转换记录不完整或无效，未重新转换；请检查记录或勾选“重新建立（全部转换）”。')
+    return latest
 
 
 def check_conversion_environment(python: Path) -> dict:
@@ -201,14 +267,29 @@ def perform_job(kind: str, payload: dict, progress) -> object:
             raise FileExistsError('输出目录已经存在，未覆盖。')
         progress({'message': '正在检查转换环境…'})
         check_conversion_environment(payload['python'])
+        if payload.get('rebuild') is True:
+            prior = None
+            progress({'message': '已选择重新建立，将转换全部示范；原始数据和旧导出不受影响。'})
+        else:
+            saved_prior = payload.get('prior_path')
+            if saved_prior:
+                prior = Path(saved_prior)
+                if not is_incremental_candidate(prior):
+                    raise ValueError('上次转换记录不可用，未重新转换。请检查原路径，或勾选“重新建立（全部转换）”。')
+            else:
+                prior = find_latest_incremental(output.parent)
+            if prior is None:
+                progress({'message': '没有可用转换记录，将重新处理全部示范；旧导出不受影响。'})
+            else:
+                progress({'message': '正在核对之前的转换记录：' + str(prior)})
         # TemporaryDirectory owns this new, uniquely named staging directory;
         # the original recordings and any prior exports remain untouched.
-        with tempfile.TemporaryDirectory(prefix='.jarvis-conversion-', dir=output.parent) as folder:
+        with tempfile.TemporaryDirectory(prefix='.jc-', dir=output.parent) as folder:
             bundle = Path(folder) / 'bundle'
             progress({'message': '正在检查并整理已审核示范…'})
             export_bundle(payload['episodes'], bundle, seed=42, progress=progress)
-            progress({'message': '正在转换 LeRobot 数据…'})
-            return run_conversion(bundle, output, payload['python'], progress)
+            progress({'message': '正在检查已有数据并转换新增示范…'})
+            return run_incremental_conversion(bundle, output, payload['python'], progress, prior=prior)
     raise ValueError('未知的样本处理任务。')
 
 
@@ -234,11 +315,14 @@ class DatasetPage(tk.Frame):
         self._current_approved = False
         self._last_bundle = None
         self._dataset_python = self._saved_dataset_python()
+        self._dataset_prior = self._saved_prior_export()
         self.environment_text = tk.StringVar(value=self._environment_description())
+        self.prior_text = tk.StringVar(value=self._prior_description())
         self.status_text = tk.StringVar(value='录完一条示范后，会自动整理到这里。')
         self.folder_text = tk.StringVar(value='')
         self.details_text = tk.StringVar(value='选择一条样本，查看两路画面及记录结果。')
         self.sample_text = tk.StringVar(value='')
+        self.rebuild_export = tk.BooleanVar(value=False)
         self.review_vars = {key: tk.BooleanVar(value=False) for key in REVIEW_KEYS}
         self._build()
         self._set_controls()
@@ -282,6 +366,18 @@ class DatasetPage(tk.Frame):
             return '转换环境：所选 Python 不存在，请重新配置  ' + self._dataset_python
         return '转换环境：已选择，尚未检查  ' + self._dataset_python
 
+    def _saved_prior_export(self):
+        settings = getattr(self.app, 'settings', None)
+        try:
+            return str(settings.get('dataset_last_export') or '').strip() if settings else ''
+        except KeyError:
+            return ''
+
+    def _prior_description(self):
+        if not self._dataset_prior:
+            return '已有转换：尚未选择；导出时会检查保存目录。'
+        return '已有转换：' + self._dataset_prior + '（复用前核验）'
+
     def _label(self, parent, text='', size=10, color=TEXT, **kwargs):
         return tk.Label(parent, text=text, bg=kwargs.pop('bg', BG), fg=color,
                         font=(FONT, size), **kwargs)
@@ -320,6 +416,17 @@ class DatasetPage(tk.Frame):
                     anchor='w').pack(fill='x')
         self._label(folders, textvariable=self.environment_text, size=9, color=MUTED,
                     anchor='w').pack(fill='x')
+        self._label(folders, textvariable=self.prior_text, size=9, color=MUTED,
+                    anchor='w').pack(fill='x')
+        reuse_options = tk.Frame(folders, bg=BG)
+        reuse_options.pack(fill='x')
+        self.choose_prior_button = self._button(reuse_options, '选择已有增量数据集', self._choose_prior)
+        self.choose_prior_button.pack(side='left', padx=(0, 12))
+        self.rebuild_check = tk.Checkbutton(
+            reuse_options, text='重新建立（全部转换，保留旧结果）', variable=self.rebuild_export,
+            bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
+            selectcolor=CARD, font=(FONT, 9), anchor='w')
+        self.rebuild_check.pack(side='left')
 
         body = tk.PanedWindow(self, orient='horizontal', bg=BG, bd=0,
                               sashwidth=7, sashrelief='flat')
@@ -473,6 +580,8 @@ class DatasetPage(tk.Frame):
         self.direct_export_button.configure(state='normal' if idle and not recording else 'disabled')
         self.configure_env_button.configure(state='normal' if idle and not recording else 'disabled')
         self.check_env_button.configure(state='normal' if idle and not recording else 'disabled')
+        self.choose_prior_button.configure(state='normal' if idle and not recording else 'disabled')
+        self.rebuild_check.configure(state='normal' if idle and not recording else 'disabled')
         view_ready = bool(idle and self._rows and self._view_episode == selected)
         for widget in self.review_checks:
             widget.configure(state='normal' if view_ready else 'disabled')
@@ -547,6 +656,9 @@ class DatasetPage(tk.Frame):
                 self.status_text.set('处理未完成：' + str(value))
                 if job['kind'] == 'check_env':
                     self.environment_text.set('转换环境：检查未通过  ' + self._dataset_python)
+                elif job['kind'] == 'direct_export':
+                    self.status_text.set('处理未完成：' + str(value) +
+                        ' 如转换记录失效，可勾选“重新建立（全部转换）”再导出；旧数据保留。')
             else:
                 self._completed(job, value)
             self._dirty = True
@@ -595,7 +707,27 @@ class DatasetPage(tk.Frame):
             counts = result.get('counts') or {}
             self.status_text.set(f"已导出样本包：训练 {counts.get('train', 0)} 条、验证 {counts.get('val', 0)} 条、测试 {counts.get('test', 0)} 条。位置：{self._last_bundle}")
         elif kind in ('convert', 'direct_export'):
-            self.status_text.set('LeRobot 数据已生成：' + str(result.get('output_dir') or job['payload']['output']))
+            saved_path = str(result.get('output_dir') or job['payload']['output'])
+            incremental = result.get('incremental') or {}
+            if kind == 'direct_export' and isinstance(incremental, dict) and 'reused' in incremental and 'converted' in incremental:
+                self.status_text.set(f"已复用 {incremental['reused']} 条，新转换 {incremental['converted']} 条。位置：{saved_path}")
+            else:
+                self.status_text.set('LeRobot 数据已生成：' + saved_path)
+            if kind == 'direct_export':
+                self._dataset_prior = saved_path
+                prior_text = getattr(self, 'prior_text', None)
+                if prior_text is not None:
+                    prior_text.set(self._prior_description())
+                rebuild_export = getattr(self, 'rebuild_export', None)
+                if rebuild_export is not None:
+                    rebuild_export.set(False)
+                settings = getattr(self.app, 'settings', None)
+                try:
+                    if settings is None:
+                        raise OSError('settings unavailable')
+                    settings.save(dataset_last_export=saved_path)
+                except OSError:
+                    self.status_text.set('本次路径未记住，下次自动复用无法保证；请修复写入权限并保留该数据集：' + saved_path)
         elif kind == 'check_env':
             if str(job['payload']['python']) == self._dataset_python:
                 self.environment_text.set('转换环境：依赖检查通过（实际转换仍需验证）  ' + self._dataset_python)
@@ -653,6 +785,30 @@ class DatasetPage(tk.Frame):
         self.environment_text.set('转换环境：正在检查…  ' + self._dataset_python)
         self._enqueue('check_env', {'python': Path(self._dataset_python)})
 
+    def _choose_prior(self):
+        if self.busy or self._recording_busy() or self._closing:
+            return
+        selected = filedialog.askdirectory(
+            title='选择已有增量数据集（导出时会完整核验）',
+            initialdir=self._dataset_prior or str(self._recording_root().parent), parent=self.app)
+        if not selected:
+            return
+        path = Path(selected)
+        if not is_incremental_candidate(path):
+            messagebox.showerror('无法使用转换记录', '所选目录没有完整的增量来源清单，旧版导出不能直接复用。', parent=self.app)
+            return
+        self._dataset_prior = str(path)
+        self.prior_text.set(self._prior_description())
+        settings = getattr(self.app, 'settings', None)
+        try:
+            if settings is None:
+                raise OSError('settings unavailable')
+            settings.save(dataset_last_export=self._dataset_prior)
+        except OSError:
+            self.status_text.set('本次路径未记住，下次自动复用无法保证；请修复写入权限并保留该数据集：' + self._dataset_prior)
+            return
+        self.status_text.set('已选择此前的数据集，导出时会核验来源和文件完整性。')
+
     def _direct_export(self):
         if self.busy or self._recording_busy() or self._closing:
             self.status_text.set('请先结束录制并等待当前处理完成，再导出。')
@@ -670,8 +826,11 @@ class DatasetPage(tk.Frame):
         if not folder:
             return
         output = Path(folder) / f'lerobot_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}'
+        saved_prior = self._dataset_prior
         self._enqueue('direct_export', {'episodes': candidates, 'output': output,
-                                        'python': Path(self._dataset_python)})
+                                        'python': Path(self._dataset_python),
+                                        'prior_path': saved_prior or None,
+                                        'rebuild': bool(self.rebuild_export.get())})
 
     def _export(self):
         if self.busy or self._recording_busy() or self._closing:
