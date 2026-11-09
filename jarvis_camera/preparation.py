@@ -20,6 +20,10 @@ import uuid
 
 CLOCK = 'python_perf_counter_ns'
 ACTION_SCHEMA = 'next_measured_position_v1'
+# Fixed reference for the project's Kinova tabletop working posture. Keeping the
+# same branch across episodes is essential for absolute position training.
+JOINT_REFERENCE_DEGREES = (0, 340, 180, 214, 0, 310, 90)
+JOINT_REPRESENTATION = 'centered_degrees_to_radians_v1'
 REVIEW_CHECKS = ('alignment', 'position_targets', 'stable_end')
 RAW_FILES = ('metadata.json', 'events.jsonl', 'robot_feedback.jsonl',
              'top_frames.jsonl', 'wrist_frames.jsonl',
@@ -317,11 +321,26 @@ def _prepare(documents: dict, config: PreparationConfig, manifest: dict) -> list
 
     used_start = max(0, robot_indices[0])
     used_end = robot_indices[-1]
+    raw_degrees = degrees
+    degrees = [row.copy() for row in raw_degrees]
+    for index in range(used_start, used_end + 1):
+        for joint, center in enumerate(JOINT_REFERENCE_DEGREES):
+            offset = (raw_degrees[index][joint] - center + 180.0) % 360.0 - 180.0
+            if math.isclose(abs(offset), 180.0, abs_tol=1e-9):
+                raise _Invalid('joint_reference_boundary', '关节角处于统一参考的分支边界，无法确定应使用的角度。')
+            degrees[index][joint] = center + offset
+        states[index] = [math.radians(value) for value in degrees[index]] + [states[index][7]]
+
     for index in range(used_start + 1, used_end + 1):
         differences = [abs(a - b) for a, b in zip(degrees[index], degrees[index - 1])]
-        if max(differences) > 180:
-            raise _Invalid('joint_angle_wrap', '关节角跨越了角度边界，需要明确关节参考后再处理；没有盲目展开角度。')
+        raw_differences = [abs(a - b) for a, b in zip(raw_degrees[index], raw_degrees[index - 1])]
         dt = (robot_times[index] - robot_times[index - 1]) / 1e9
+        if dt * config.max_joint_speed_deg_s >= 180:
+            raise _Invalid('joint_angle_ambiguous', '机器人反馈间隔过长，无法确定关节角跨界方向。')
+        if max(raw_differences) > 360:
+            raise _Invalid('joint_angle_ambiguous', '相邻关节反馈相差超过一整圈，无法确定实际运动。')
+        if max(differences) >= 180:
+            raise _Invalid('joint_reference_boundary', '关节角跨越统一参考的分支边界，需要检查关节参考。')
         if max(differences) / dt > config.max_joint_speed_deg_s:
             raise _Invalid('joint_jump', '关节角变化超过本次数据检查阈值，请检查时间和角度单位。')
 
@@ -407,7 +426,8 @@ def prepare_episode(episode_dir, config=None) -> dict:
         'state_names': [f'q{i}' for i in range(1, 8)] + ['gripper_measured'],
         'action_names': [f'q{i}_target' for i in range(1, 8)] + ['gripper_position_proxy'],
         'units': {'joints': 'radian', 'gripper': 'normalized_0_1'},
-        'joint_representation': 'raw_degrees_converted_to_radians_no_wrap',
+        'joint_representation': JOINT_REPRESENTATION,
+        'joint_reference_degrees': list(JOINT_REFERENCE_DEGREES),
         'gripper_label_source': 'next_measured_position_proxy_not_command',
         'alignment': 'causal_host_receipt_time', 'source_fingerprint': None,
         'configuration': asdict(config), 'metrics': {},

@@ -101,7 +101,10 @@ def _bundle(bundle_root, progress=None, *, verify_images=True):
     if (type(fps) is not int or not 1 <= fps <= 50
             or contract.get('action_schema') != 'next_measured_position_v1'
             or contract.get('units') != {'joints': 'radian', 'gripper': 'normalized_0_1'}
-            or any(contract.get(k) != v for k, v in worker.POSITION_CONTRACT.items())):
+            or contract.get('joint_representation') not in worker.SUPPORTED_JOINT_REPRESENTATIONS
+            or not worker._valid_joint_reference(contract)
+            or any(contract.get(k) != v for k, v in worker.POSITION_CONTRACT.items()
+                   if k != 'joint_representation')):
         raise ValueError('数据包的动作或采样定义不受支持。')
     entries = bundle.get('episodes')
     if not isinstance(entries, list) or len(entries) < 3:

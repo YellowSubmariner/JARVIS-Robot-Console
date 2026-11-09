@@ -205,10 +205,85 @@ class PreparationTests(unittest.TestCase):
         self.mutate_rows('top_frames.jsonl', lambda rows: rows[10].update(file='../outside.jpg'))
         self.assert_blocked('invalid_path')
 
-    def test_joint_wrap_is_not_silently_unwrapped(self):
+    def test_forward_and_reverse_wrap_keep_state_action_continuous(self):
+        def set_trajectory(rows):
+            for index, row in enumerate(rows):
+                step = min(index, 20)
+                row['feedback']['actuators'][0]['position'] = (350 + step) % 360
+                row['feedback']['actuators'][1]['position'] = (10 - step) % 360
+
+        self.mutate_rows('robot_feedback.jsonl', set_trajectory)
+        raw_before = (self.root / 'robot_feedback.jsonl').read_bytes()
+        manifest = prepare_episode(self.root)
+        self.assertTrue(manifest['technical_pass'])
+        self.assertEqual(manifest['joint_representation'], 'centered_degrees_to_radians_v1')
+        _, samples = load_prepared_episode(self.root)
+        self.assertAlmostEqual(samples[9]['observation.state'][0], math.radians(-1))
+        self.assertAlmostEqual(samples[9]['action'][0], 0)
+        self.assertAlmostEqual(samples[10]['action'][0], math.radians(1))
+        self.assertAlmostEqual(samples[9]['observation.state'][1], math.radians(361))
+        self.assertAlmostEqual(samples[9]['action'][1], math.radians(360))
+        self.assertAlmostEqual(samples[10]['action'][1], math.radians(359))
+        for first, second in zip(samples, samples[1:]):
+            self.assertEqual(first['action'], second['observation.state'])
+        self.assertEqual((self.root / 'robot_feedback.jsonl').read_bytes(), raw_before)
+
+    def test_wrap_oscillation_at_terminal_is_stable(self):
+        def set_trajectory(rows):
+            for index, row in enumerate(rows):
+                row['feedback']['actuators'][0]['position'] = 359.9 if index % 2 else 0.1
+
+        self.mutate_rows('robot_feedback.jsonl', set_trajectory)
+        manifest = prepare_episode(self.root)
+        self.assertTrue(manifest['technical_pass'])
+        self.assertAlmostEqual(manifest['metrics']['terminal_joint_range_deg'][0], .2)
+
+    def test_episode_starting_on_either_side_of_zero_uses_same_reference(self):
+        other = make_episode(Path(self.temp.name) / 'other_episode')
+        for root, angle in ((self.root, 359.9), (other, .1)):
+            path = root / 'robot_feedback.jsonl'
+            rows = read_rows(path)
+            for row in rows:
+                row['feedback']['actuators'][0]['position'] = angle
+            write_rows(path, rows)
+            self.assertTrue(prepare_episode(root)['technical_pass'])
+        _, left = load_prepared_episode(self.root)
+        _, right = load_prepared_episode(other)
+        self.assertAlmostEqual(left[0]['observation.state'][0], math.radians(-.1))
+        self.assertAlmostEqual(right[0]['observation.state'][0], math.radians(.1))
+
+    def test_reference_branch_crossing_is_rejected(self):
+        def set_trajectory(rows):
+            for index, row in enumerate(rows):
+                row['feedback']['actuators'][0]['position'] = 179 if index < 10 else 181
+
+        self.mutate_rows('robot_feedback.jsonl', set_trajectory)
+        self.assert_blocked('joint_reference_boundary')
+
+    def test_reference_boundary_exactly_is_ambiguous(self):
         self.mutate_rows('robot_feedback.jsonl',
-                         lambda rows: rows[10]['feedback']['actuators'][0].update(position=359))
-        self.assert_blocked('joint_angle_wrap')
+                         lambda rows: rows[10]['feedback']['actuators'][0].update(position=180))
+        self.assert_blocked('joint_reference_boundary')
+
+    def test_fast_cross_boundary_jump_still_rejected(self):
+        def set_trajectory(rows):
+            for index, row in enumerate(rows):
+                row['feedback']['actuators'][0]['position'] = 359 if index < 10 else 10
+
+        self.mutate_rows('robot_feedback.jsonl', set_trajectory)
+        self.assert_blocked('joint_jump')
+
+    def test_zero_and_full_turn_are_equivalent_at_boundary(self):
+        def set_trajectory(rows):
+            for index, row in enumerate(rows):
+                row['feedback']['actuators'][0]['position'] = 360 if index % 2 else 0
+
+        self.mutate_rows('robot_feedback.jsonl', set_trajectory)
+        manifest = prepare_episode(self.root)
+        self.assertTrue(manifest['technical_pass'])
+        _, samples = load_prepared_episode(self.root)
+        self.assertTrue(all(row['observation.state'][0] == 0 for row in samples))
+        self.assertTrue(all(row['action'][0] == 0 for row in samples))
 
     def test_implausible_jump_blocks(self):
         self.mutate_rows('robot_feedback.jsonl',
@@ -392,6 +467,9 @@ class PreparationTests(unittest.TestCase):
                                 dataset_factory=FakeDataset)
         self.assertEqual(bundle['counts'], {'train': 1, 'val': 1, 'test': 1, 'total': 3})
         self.assertEqual(result['counts'], bundle['counts'])
+        self.assertEqual(bundle['feature_contract']['joint_representation'], 'centered_degrees_to_radians_v1')
+        self.assertEqual(bundle['feature_contract']['joint_reference_degrees'], [0, 340, 180, 214, 0, 310, 90])
+        self.assertEqual(result['feature_contract'], bundle['feature_contract'])
         self.assertEqual(len(datasets), 3)
         self.assertEqual(sum(len(dataset.episodes[0]) for dataset in datasets), 120)
         for dataset in datasets:

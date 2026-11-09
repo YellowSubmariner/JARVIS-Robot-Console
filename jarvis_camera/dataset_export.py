@@ -31,6 +31,11 @@ POSITION_CONTRACT = {
     'gripper_label_source': 'next_measured_position_proxy_not_command',
     'alignment': 'causal_host_receipt_time',
 }
+SUPPORTED_JOINT_REPRESENTATIONS = (
+    'raw_degrees_converted_to_radians_no_wrap',
+    'centered_degrees_to_radians_v1',
+)
+CENTERED_REFERENCE_DEGREES = [0, 340, 180, 214, 0, 310, 90]
 
 
 def load_prepared_episode(episode_dir, *, require_review=True, include_source_hashes=False):
@@ -81,6 +86,14 @@ def _contract(manifest: dict) -> dict:
     if missing:
         raise ValueError('整理结果缺少动作定义，请用当前版本重新整理。')
     contract = {key: manifest[key] for key in CONTRACT_KEYS}
+    if contract['joint_representation'] == 'centered_degrees_to_radians_v1':
+        reference = manifest.get('joint_reference_degrees')
+        if (not isinstance(reference, list) or reference != CENTERED_REFERENCE_DEGREES
+                or any(type(value) is not int for value in reference)):
+            raise ValueError('关节参考不符合此版本的角度定义，请重新整理。')
+        contract['joint_reference_degrees'] = reference
+    elif 'joint_reference_degrees' in manifest:
+        raise ValueError('关节参考与角度定义不一致，请重新整理。')
     fps = contract['fps']
     if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or not 1 <= fps <= 50 or int(fps) != fps:
         raise ValueError('当前导出要求 1–50 之间的整数采样频率。')
@@ -89,7 +102,9 @@ def _contract(manifest: dict) -> dict:
         raise ValueError('此版本不支持该动作标签格式。')
     if contract['units'] != {'joints': 'radian', 'gripper': 'normalized_0_1'}:
         raise ValueError('关节或夹爪单位不符合此版本的导出定义。')
-    if any(contract[key] != value for key, value in POSITION_CONTRACT.items()):
+    if (contract['joint_representation'] not in SUPPORTED_JOINT_REPRESENTATIONS
+            or any(contract[key] != value for key, value in POSITION_CONTRACT.items()
+                   if key != 'joint_representation')):
         raise ValueError('关节顺序、夹爪来源或时间对齐定义不符合此版本，请重新整理。')
     # Reject non-JSON values before any output directory is created.
     json.dumps(contract, allow_nan=False)

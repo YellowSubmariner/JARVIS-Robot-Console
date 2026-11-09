@@ -31,6 +31,19 @@ POSITION_CONTRACT = {
     'gripper_label_source': 'next_measured_position_proxy_not_command',
     'alignment': 'causal_host_receipt_time',
 }
+SUPPORTED_JOINT_REPRESENTATIONS = (
+    'raw_degrees_converted_to_radians_no_wrap',
+    'centered_degrees_to_radians_v1',
+)
+CENTERED_REFERENCE_DEGREES = [0, 340, 180, 214, 0, 310, 90]
+
+
+def _valid_joint_reference(contract):
+    if contract.get('joint_representation') != 'centered_degrees_to_radians_v1':
+        return 'joint_reference_degrees' not in contract
+    reference = contract.get('joint_reference_degrees')
+    return (isinstance(reference, list) and reference == CENTERED_REFERENCE_DEGREES
+            and all(type(value) is int for value in reference))
 
 
 def _safe_file(root: Path, relative: str) -> Path:
@@ -148,7 +161,10 @@ def convert_bundle(bundle_dir, output_dir, *, dataset_factory=None, progress=Non
     fps = int(fps)
     if contract.get('action_schema') != 'next_measured_position_v1' or contract.get('units') != {'joints': 'radian', 'gripper': 'normalized_0_1'}:
         raise ValueError('数据包动作定义不受此版本支持。')
-    if any(contract.get(key) != value for key, value in POSITION_CONTRACT.items()):
+    if (contract.get('joint_representation') not in SUPPORTED_JOINT_REPRESENTATIONS
+            or not _valid_joint_reference(contract)
+            or any(contract.get(key) != value for key, value in POSITION_CONTRACT.items()
+                   if key != 'joint_representation')):
         raise ValueError('关节顺序、夹爪来源或时间对齐定义不受此版本支持。')
     entries = bundle.get('episodes', [])
     if not isinstance(entries, list) or len(entries) < 3:
