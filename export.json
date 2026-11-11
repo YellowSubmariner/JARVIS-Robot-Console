@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "complete": true,
+  "format": "lerobot",
+  "counts": {
+    "train": 6,
+    "val": 2,
+    "test": 2,
+    "total": 10
+  },
+  "feature_contract": {
+    "action_schema": "next_measured_position_v1",
+    "fps": 20,
+    "state_names": [
+      "q1",
+      "q2",
+      "q3",
+      "q4",
+      "q5",
+      "q6",
+      "q7",
+      "gripper_measured"
+    ],
+    "action_names": [
+      "q1_target",
+      "q2_target",
+      "q3_target",
+      "q4_target",
+      "q5_target",
+      "q6_target",
+      "q7_target",
+      "gripper_position_proxy"
+    ],
+    "units": {
+      "gripper": "normalized_0_1",
+      "joints": "radian"
+    },
+    "joint_representation": "centered_degrees_to_radians_v1",
+    "gripper_label_source": "next_measured_position_proxy_not_command",
+    "alignment": "wrist_receive_delay_compensated_v1",
+    "wrist_receive_delay_ms": 601,
+    "joint_reference_degrees": [
+      0,
+      340,
+      180,
+      214,
+      0,
+      310,
+      90
+    ]
+  },
+  "source_bundle_sha256": "9185e2f4576057533749e0995a404908304b580d86925a1ac6fa22197dcb10bb",
+  "splits": {
+    "train": [
+      "episode_000001",
+      "episode_000002",
+      "episode_000003",
+      "episode_000004",
+      "episode_000005",
+      "episode_000006"
+    ],
+    "val": [
+      "episode_000007",
+      "episode_000008"
+    ],
+    "test": [
+      "episode_000009",
+      "episode_000010"
+    ]
+  },
+  "software": {
+    "revision": "9e5ee9859480e425a97a6836bb3fee479539beb5",
+    "version": "0.6.2",
+    "revision_verified": true
+  },
+  "statistics_note": "Each split is written independently; train statistics are computed from train episodes only. Load saved training processors during evaluation.",
+  "incremental": {
+    "reused": 0,
+    "converted": 10
+  }
+}
